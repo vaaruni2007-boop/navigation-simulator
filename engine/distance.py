@@ -10,13 +10,29 @@ EARTH_RADIUS_KM = 6371.0088
 KM_PER_NAUTICAL_MILE = 1.852
 
 
+def km_to_nm(distance_km: float) -> float:
+    """Convert kilometres to nautical miles."""
+
+    if distance_km < 0:
+        raise ValueError("distance_km must be non-negative")
+
+    return distance_km / KM_PER_NAUTICAL_MILE
+
+
+def nm_to_km(distance_nm: float) -> float:
+    """Convert nautical miles to kilometres."""
+
+    if distance_nm < 0:
+        raise ValueError("distance_nm must be non-negative")
+
+    return distance_nm * KM_PER_NAUTICAL_MILE
+
+
 def haversine_distance_km(
     point1: Waypoint,
     point2: Waypoint,
 ) -> float:
-    """
-    Calculate great-circle distance between two waypoints in kilometres.
-    """
+    """Calculate great-circle distance between two waypoints in kilometres."""
 
     latitude1 = math.radians(point1.latitude)
     latitude2 = math.radians(point2.latitude)
@@ -49,7 +65,9 @@ def haversine_distance_nm(
 ) -> float:
     """Calculate great-circle distance between two waypoints in nautical miles."""
 
-    return haversine_distance_km(point1, point2) / KM_PER_NAUTICAL_MILE
+    return km_to_nm(
+        haversine_distance_km(point1, point2)
+    )
 
 
 def calculate_route_distance_km(
@@ -74,10 +92,14 @@ def calculate_route_distance_nm(
 ) -> float:
     """Calculate total route distance in nautical miles."""
 
-    return calculate_route_distance_km(waypoints) / KM_PER_NAUTICAL_MILE
+    return km_to_nm(
+        calculate_route_distance_km(waypoints)
+    )
 
 
 __all__ = [
+    "km_to_nm",
+    "nm_to_km",
     "haversine_distance_km",
     "haversine_distance_nm",
     "calculate_route_distance_km",

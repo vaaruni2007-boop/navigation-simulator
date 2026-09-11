@@ -15,7 +15,7 @@ def knots_to_kmh(speed_knots: float) -> float:
     return speed_knots * KM_PER_NAUTICAL_MILE
 
 
-def calculate_voyage_hours(
+def voyage_duration_hours(
     distance_nm: float,
     speed_knots: float,
 ) -> float:
@@ -30,13 +30,13 @@ def calculate_voyage_hours(
     return distance_nm / speed_knots
 
 
-def calculate_voyage_days(
+def voyage_duration_days(
     distance_nm: float,
     speed_knots: float,
 ) -> float:
     """Calculate voyage duration in days."""
 
-    return calculate_voyage_hours(
+    return voyage_duration_hours(
         distance_nm,
         speed_knots,
     ) / 24.0
@@ -54,7 +54,7 @@ def calculate_eta(
             "departure_datetime must be timezone-aware"
         )
 
-    voyage_hours = calculate_voyage_hours(
+    voyage_hours = voyage_duration_hours(
         distance_nm,
         speed_knots,
     )
@@ -64,8 +64,15 @@ def calculate_eta(
     )
 
 
+# Backward-compatible aliases.
+calculate_voyage_hours = voyage_duration_hours
+calculate_voyage_days = voyage_duration_days
+
+
 __all__ = [
     "knots_to_kmh",
+    "voyage_duration_hours",
+    "voyage_duration_days",
     "calculate_voyage_hours",
     "calculate_voyage_days",
     "calculate_eta",

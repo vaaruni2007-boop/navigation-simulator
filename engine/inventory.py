@@ -9,10 +9,7 @@ from .models import ResourceInventory
 def calculate_days_until_threshold(
     inventory: ResourceInventory,
 ) -> float:
-    """
-    Calculate the number of days until inventory reaches
-    its minimum safety threshold.
-    """
+    """Calculate days until inventory reaches its safety threshold."""
 
     if inventory.current_quantity <= inventory.minimum_safety_threshold:
         return 0.0
@@ -25,22 +22,14 @@ def calculate_days_until_threshold(
         - inventory.minimum_safety_threshold
     )
 
-    return (
-        quantity_above_threshold
-        / inventory.daily_consumption
-    )
+    return quantity_above_threshold / inventory.daily_consumption
 
 
 def calculate_critical_date(
     inventory: ResourceInventory,
     current_datetime: datetime,
 ) -> datetime | None:
-    """
-    Calculate when inventory reaches its minimum safety threshold.
-
-    Returns None when consumption is zero and inventory is currently
-    above the threshold.
-    """
+    """Calculate when inventory reaches its minimum safety threshold."""
 
     if current_datetime.tzinfo is None:
         raise ValueError(
@@ -57,6 +46,29 @@ def calculate_critical_date(
     return current_datetime + timedelta(
         days=days_until_threshold
     )
+
+
+def calculate_remaining_inventory(
+    inventory: ResourceInventory,
+    elapsed_days: float,
+) -> float:
+    """
+    Calculate remaining inventory after a number of elapsed days.
+
+    Inventory is never allowed to fall below zero.
+    """
+
+    if elapsed_days < 0:
+        raise ValueError(
+            "elapsed_days must be non-negative"
+        )
+
+    remaining = (
+        inventory.current_quantity
+        - inventory.daily_consumption * elapsed_days
+    )
+
+    return max(0.0, remaining)
 
 
 def calculate_inventory_on_date(
@@ -83,12 +95,10 @@ def calculate_inventory_on_date(
         target_datetime - current_datetime
     ).total_seconds() / 86400.0
 
-    projected_quantity = (
-        inventory.current_quantity
-        - inventory.daily_consumption * elapsed_days
+    return calculate_remaining_inventory(
+        inventory,
+        elapsed_days,
     )
-
-    return max(0.0, projected_quantity)
 
 
 def calculate_required_resupply(
@@ -102,7 +112,7 @@ def calculate_required_resupply(
 def calculate_inventory_after_resupply(
     inventory: ResourceInventory,
 ) -> float:
-    """Calculate inventory after the configured resupply arrives."""
+    """Calculate inventory after configured resupply arrives."""
 
     return (
         inventory.current_quantity
@@ -112,6 +122,7 @@ def calculate_inventory_after_resupply(
 
 __all__ = [
     "calculate_days_until_threshold",
+    "calculate_remaining_inventory",
     "calculate_critical_date",
     "calculate_inventory_on_date",
     "calculate_required_resupply",

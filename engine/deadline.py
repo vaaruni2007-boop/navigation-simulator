@@ -30,12 +30,12 @@ def _require_non_negative(
     return float(value)
 
 
-def calculate_latest_safe_arrival(
+def calculate_arrival_deadline(
     critical_date: datetime,
     safety_buffer_days: float,
 ) -> datetime:
     """
-    Calculate the latest acceptable arrival time.
+    Calculate the latest safe arrival deadline.
 
     The safety buffer is subtracted from the critical date.
     """
@@ -55,11 +55,23 @@ def calculate_latest_safe_arrival(
     )
 
 
+def calculate_latest_safe_arrival(
+    critical_date: datetime,
+    safety_buffer_days: float,
+) -> datetime:
+    """Backward-compatible alias for calculate_arrival_deadline."""
+
+    return calculate_arrival_deadline(
+        critical_date,
+        safety_buffer_days,
+    )
+
+
 def calculate_latest_safe_departure(
     latest_safe_arrival: datetime,
     voyage_duration_days: float,
 ) -> datetime:
-    """Calculate the latest departure time that reaches the deadline."""
+    """Calculate latest departure that reaches the safe-arrival deadline."""
 
     latest_safe_arrival = _require_aware_utc(
         latest_safe_arrival,
@@ -80,13 +92,7 @@ def calculate_safety_margin_days(
     required_arrival: datetime,
     actual_arrival: datetime,
 ) -> float:
-    """
-    Calculate arrival safety margin in days.
-
-    Positive = early.
-    Zero = exactly on time.
-    Negative = late.
-    """
+    """Calculate arrival safety margin in days."""
 
     required_arrival = _require_aware_utc(
         required_arrival,
@@ -107,7 +113,7 @@ def is_arrival_feasible(
     actual_arrival: datetime,
     latest_safe_arrival: datetime,
 ) -> bool:
-    """Return whether the arrival meets the safe-arrival deadline."""
+    """Return whether arrival meets the safe-arrival deadline."""
 
     actual_arrival = _require_aware_utc(
         actual_arrival,
@@ -122,9 +128,15 @@ def is_arrival_feasible(
     return actual_arrival <= latest_safe_arrival
 
 
+# Test-compatible alias.
+is_arrival_before_deadline = is_arrival_feasible
+
+
 __all__ = [
+    "calculate_arrival_deadline",
     "calculate_latest_safe_arrival",
     "calculate_latest_safe_departure",
     "calculate_safety_margin_days",
     "is_arrival_feasible",
+    "is_arrival_before_deadline",
 ]
