@@ -34,6 +34,7 @@ class SimulationState:
     - fuel consumption
     - voyage predictions
     - time-dependent environmental conditions
+    - resupply risk analysis
     """
 
     clock: SimulationClock
@@ -276,12 +277,8 @@ class SimulationState:
         """
         Advance the simulation.
 
-        The caller supplies elapsed simulation seconds.
-
-        If the requested timestep crosses an environmental
-        event boundary, the timestep is split so that each
-        environmental condition is applied to the correct
-        portion of the voyage.
+        Environmental boundaries split the timestep so that
+        each segment uses the correct environmental conditions.
         """
 
         if elapsed_seconds < 0:
@@ -313,8 +310,6 @@ class SimulationState:
             if segment_seconds <= 0:
                 segment_seconds = remaining_seconds
 
-            # Apply the current environment to this segment
-            # before moving the vessel.
             environment = self.current_environment
 
             self.clock.advance(
@@ -328,9 +323,6 @@ class SimulationState:
 
             self._update_inventory()
 
-            # Fuel is now accumulated from actual simulated
-            # time and environmental conditions rather than
-            # being inferred from voyage progress.
             self._accumulate_fuel_consumption(
                 segment_seconds,
                 environment,
@@ -360,9 +352,6 @@ class SimulationState:
         """
         Determine how many seconds can be simulated before
         the next environmental boundary.
-
-        If there is no upcoming boundary, the complete
-        requested timestep is returned.
         """
 
         next_change = self._next_environment_change()
@@ -403,6 +392,204 @@ class SimulationState:
 
         self._update_environment()
         self._calculate_predictions()
+
+    # ------------------------------------------------------------------
+    # Risk analysis
+    # ------------------------------------------------------------------
+
+    def calculate_safety_margin_days(self) -> Optional[float]:
+        """
+        Calculate the current arrival safety margin.
+
+        Positive  = arrival is before the safe deadline.
+        Zero       = arrival is exactly at the safe deadline.
+        Negative   = arrival is after the safe deadline.
+        """
+
+        if (
+            self.latest_safe_arrival is None
+            or self.estimated_arrival is None
+        ):
+            return None
+
+        return deadline_mod.calculate_safety_margin_days(
+            self.latest_safe_arrival,
+            self.estimated_arrival,
+        )
+
+    @property
+    def arrival_feasible(self) -> Optional[bool]:
+        """
+        Return whether the currently estimated arrival
+        meets the safe-arrival deadline.
+        """
+
+        if (
+            self.latest_safe_arrival is None
+            or self.estimated_arrival is None
+        ):
+            return None
+
+        return deadline_mod.is_arrival_feasible(
+            self.estimated_arrival,
+            self.latest_safe_arrival,
+        )
+
+    @property
+    def arrival_risk_status(self) -> str:
+        """
+        Return a high-level arrival risk classification.
+
+        SAFE:
+            ETA is comfortably before the deadline.
+
+        AT_RISK:
+            ETA is within the safety deadline but has little
+            remaining margin.
+
+        CRITICAL:
+            ETA is already beyond the safe-arrival deadline.
+        """
+
+        margin = self.calculate_safety_margin_days()
+
+        if margin is None:
+            return "UNKNOWN"
+
+        if margin < 0:
+            return "CRITICAL"
+
+        if margin <= self.safety_buffer_days:
+            return "AT_RISK"
+
+        return "SAFE"
+
+    def get_resource_risk(self) -> Dict[str, dict]:
+        """
+        Return risk information for every station resource.
+        """
+
+        result: Dict[str, dict] = {}
+
+        for resource_name, resource in (
+            self.station_inventory.items()
+        ):
+            critical_date = (
+                inventory_mod.calculate_critical_date(
+                    resource,
+                    self._initial_simulation_datetime(),
+                )
+            )
+
+            if critical_date is None:
+                result[resource_name] = {
+                    "resource_name": resource.resource_name,
+                    "current_quantity": self.current_inventory.get(
+                        resource_name,
+                        resource.current_quantity,
+                    ),
+                    "daily_consumption": resource.daily_consumption,
+                    "critical_date": None,
+                    "latest_safe_arrival": None,
+                    "status": "NO_DEPLETION_RISK",
+                    "days_until_critical": None,
+                }
+                continue
+
+            latest_safe_arrival = (
+                deadline_mod.calculate_latest_safe_arrival(
+                    critical_date,
+                    self.safety_buffer_days,
+                )
+            )
+
+            days_until_critical = (
+                critical_date
+                - self.simulation_datetime
+            ).total_seconds() / 86400.0
+
+            if days_until_critical < 0:
+                resource_status = "CRITICAL"
+            elif self.estimated_arrival is not None:
+                if (
+                    self.estimated_arrival
+                    > latest_safe_arrival
+                ):
+                    resource_status = "CRITICAL"
+                elif (
+                    (
+                        latest_safe_arrival
+                        - self.estimated_arrival
+                    ).total_seconds()
+                    / 86400.0
+                    <= self.safety_buffer_days
+                ):
+                    resource_status = "AT_RISK"
+                else:
+                    resource_status = "SAFE"
+            else:
+                resource_status = "SAFE"
+
+            result[resource_name] = {
+                "resource_name": resource.resource_name,
+                "current_quantity": self.current_inventory.get(
+                    resource_name,
+                    resource.current_quantity,
+                ),
+                "daily_consumption": resource.daily_consumption,
+                "critical_date": critical_date.isoformat(),
+                "latest_safe_arrival": (
+                    latest_safe_arrival.isoformat()
+                ),
+                "status": resource_status,
+                "days_until_critical": days_until_critical,
+            }
+
+        return result
+
+    def get_risk_summary(self) -> dict:
+        """
+        Return a complete mission-level risk summary.
+        """
+
+        resource_risk = self.get_resource_risk()
+
+        statuses = [
+            item["status"]
+            for item in resource_risk.values()
+        ]
+
+        if "CRITICAL" in statuses:
+            overall_status = "CRITICAL"
+        elif "AT_RISK" in statuses:
+            overall_status = "AT_RISK"
+        else:
+            overall_status = "SAFE"
+
+        return {
+            "overall_status": overall_status,
+            "arrival_status": self.arrival_risk_status,
+            "arrival_feasible": self.arrival_feasible,
+            "safety_margin_days": (
+                self.calculate_safety_margin_days()
+            ),
+            "estimated_arrival": (
+                self.estimated_arrival.isoformat()
+                if self.estimated_arrival
+                else None
+            ),
+            "latest_safe_arrival": (
+                self.latest_safe_arrival.isoformat()
+                if self.latest_safe_arrival
+                else None
+            ),
+            "predicted_critical_date": (
+                self.predicted_critical_date.isoformat()
+                if self.predicted_critical_date
+                else None
+            ),
+            "resources": resource_risk,
+        }
 
     # ------------------------------------------------------------------
     # State export
@@ -481,6 +668,7 @@ class SimulationState:
                     self.active_environment_event
                 ),
             },
+            "risk": self.get_risk_summary(),
         }
 
     # ------------------------------------------------------------------
@@ -590,16 +778,6 @@ class SimulationState:
     ) -> None:
         """
         Accumulate actual fuel consumed during a simulation segment.
-
-        Fuel consumption is based on:
-
-            base fuel burn
-            × elapsed simulation time
-            × environmental fuel multiplier
-
-        This means storms, heavy sea ice and poor visibility can
-        increase fuel consumption even when they simultaneously
-        reduce vessel speed.
         """
 
         if elapsed_seconds <= 0:

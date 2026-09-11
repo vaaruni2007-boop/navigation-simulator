@@ -453,3 +453,133 @@ def test_environment_is_exposed_in_mission_state():
     assert "environment" in state
     assert state["environment"]["active_event"] == "Heavy Sea Ice"
     assert state["environment"]["sea_ice_severity"] == 0.9
+def test_mission_calculates_safety_margin():
+    mission = make_mission()
+
+    mission.start()
+
+    margin = (
+        mission.simulation_state
+        .calculate_safety_margin_days()
+    )
+
+    assert margin is not None
+
+
+def test_mission_reports_arrival_feasibility():
+    mission = make_mission()
+
+    mission.start()
+
+    assert (
+        mission.simulation_state.arrival_feasible
+        is True
+    )
+
+
+def test_mission_has_arrival_risk_status():
+    mission = make_mission()
+
+    mission.start()
+
+    assert (
+        mission.simulation_state.arrival_risk_status
+        in {
+            "SAFE",
+            "AT_RISK",
+            "CRITICAL",
+            "UNKNOWN",
+        }
+    )
+
+
+def test_resource_risk_contains_diesel():
+    mission = make_mission()
+
+    mission.start()
+
+    risk = (
+        mission.simulation_state
+        .get_resource_risk()
+    )
+
+    assert "diesel" in risk
+
+    diesel = risk["diesel"]
+
+    assert diesel["resource_name"] == "Diesel"
+    assert diesel["current_quantity"] > 0
+    assert diesel["daily_consumption"] == 100.0
+    assert diesel["critical_date"] is not None
+    assert diesel["latest_safe_arrival"] is not None
+
+
+def test_resource_risk_detects_critical_arrival():
+    mission = make_mission()
+
+    mission.start()
+
+    # Force the estimated arrival beyond the safe deadline.
+    mission.simulation_state.estimated_arrival = (
+        mission.simulation_state.latest_safe_arrival
+        + timedelta(days=2)
+    )
+
+    risk = (
+        mission.simulation_state
+        .get_resource_risk()
+    )
+
+    assert risk["diesel"]["status"] == "CRITICAL"
+
+
+def test_resource_risk_detects_safe_arrival():
+    mission = make_mission()
+
+    mission.start()
+
+    mission.simulation_state.estimated_arrival = (
+        mission.simulation_state.latest_safe_arrival
+        - timedelta(days=5)
+    )
+
+    risk = (
+        mission.simulation_state
+        .get_resource_risk()
+    )
+
+    assert risk["diesel"]["status"] == "SAFE"
+
+
+def test_risk_summary_is_exposed_in_state():
+    mission = make_mission()
+
+    mission.start()
+
+    state = mission.get_state()
+
+    assert "risk" in state
+    assert "overall_status" in state["risk"]
+    assert "arrival_status" in state["risk"]
+    assert "resources" in state["risk"]
+    assert "diesel" in state["risk"]["resources"]
+
+
+def test_risk_summary_becomes_critical_when_arrival_is_late():
+    mission = make_mission()
+
+    mission.start()
+
+    mission.simulation_state.estimated_arrival = (
+        mission.simulation_state.latest_safe_arrival
+        + timedelta(days=2)
+    )
+
+    summary = (
+        mission.simulation_state
+        .get_risk_summary()
+    )
+
+    assert summary["overall_status"] == "CRITICAL"
+    assert summary["arrival_status"] == "CRITICAL"
+    assert summary["arrival_feasible"] is False    
