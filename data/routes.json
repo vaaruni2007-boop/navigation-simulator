@@ -1,0 +1,60 @@
+{
+  "routes": [
+    {
+      "id": "R001",
+      "name": "Mumbai‑Maitri Direct",
+      "origin_port_id": "MUMBAI",
+      "destination_station_id": "MAITRI",
+      "waypoints": [
+          { "latitude": 18.9679, "longitude": 72.8347 },
+          { "latitude": -20.0,   "longitude": 30.0 },
+          { "latitude": -70.753, "longitude": 11.732 }
+        ],
+      "distance_km": 14500,
+      "route_type": "direct",
+      "base_risk_factor": 0.25
+    },
+    {
+      "id": "R002",
+      "name": "Mumbai‑Bharati Southern Passage",
+      "origin_port_id": "MUMBAI",
+      "destination_station_id": "BHARATI",
+      "waypoints": [
+          { "latitude": 18.9679, "longitude": 72.8347 },
+          { "latitude": -30.0,   "longitude": 40.0 },
+          { "latitude": -69.011, "longitude": 76.532 }
+        ],
+      "distance_km": 16200,
+      "route_type": "southern_passage",
+      "base_risk_factor": 0.20
+    },
+    {
+      "id": "R003",
+      "name": "Chennai‑Maitri Fast Current",
+      "origin_port_id": "CHENNAI",
+      "destination_station_id": "MAITRI",
+      "waypoints": [
+          { "latitude": 13.0919, "longitude": 80.2785 },
+          { "latitude": -15.0,   "longitude": 25.0 },
+          { "latitude": -70.753, "longitude": 11.732 }
+        ],
+      "distance_km": 14900,
+      "route_type": "fast_current",
+      "base_risk_factor": 0.30
+    },
+    {
+      "id": "R004",
+      "name": "Chennai‑Bharati Low‑Risk Extended",
+      "origin_port_id": "CHENNAI",
+      "destination_station_id": "BHARATI",
+      "waypoints": [
+          { "latitude": 13.0919, "longitude": 80.2785 },
+          { "latitude": -25.0,   "longitude": 50.0 },
+          { "latitude": -69.011, "longitude": 76.532 }
+        ],
+      "distance_km": 16800,
+      "route_type": "low_risk_extended",
+      "base_risk_factor": 0.15
+    }
+  ]
+}
