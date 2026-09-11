@@ -1,0 +1,22 @@
+{
+  "ports": [
+    {
+      "id": "MUMBAI",
+      "name": "Mumbai Port",
+      "country": "India",
+      "latitude": 18.9679,
+      "longitude": 72.8347,
+      "cargo_handling_capacity_tonnes": 150000,
+      "available_for_simulation": true
+    },
+    {
+      "id": "CHENNAI",
+      "name": "Chennai Port",
+      "country": "India",
+      "latitude": 13.0919,
+      "longitude": 80.2785,
+      "cargo_handling_capacity_tonnes": 120000,
+      "available_for_simulation": true
+    }
+  ]
+}

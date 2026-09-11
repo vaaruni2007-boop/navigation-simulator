@@ -1,0 +1,24 @@
+{
+  "stations": [
+    {
+      "id": "MAITRI",
+      "name": "Maitri",
+      "country": "India",
+      "latitude": -70.753,
+      "longitude": 11.732,
+      "operational_status": "operational",
+      "inventory_reference": "scenario_01",
+      "receiving_capacity_tonnes": 5000
+    },
+    {
+      "id": "BHARATI",
+      "name": "Bharati",
+      "country": "India",
+      "latitude": -69.011,
+      "longitude": 76.532,
+      "operational_status": "operational",
+      "inventory_reference": "scenario_01",
+      "receiving_capacity_tonnes": 4000
+    }
+  ]
+}

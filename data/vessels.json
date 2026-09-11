@@ -1,0 +1,64 @@
+{
+  "vessels": [
+    {
+      "id": "V001",
+      "name": "Swift Arctic",
+      "vessel_type": "Container Ship",
+      "cruising_speed_knots": 18,
+      "maximum_speed_knots": 22,
+      "cargo_capacity_tonnes": 2000,
+      "fuel_capacity_litres": 500000,
+      "fuel_consumption_litres_per_day": 12000,
+      "operating_cost_per_day": 25000,
+      "fuel_cost_per_litre": 1.2,
+      "availability_start": "2026-12-01T00:00:00Z",
+      "availability_end": "2027-03-31T23:59:59Z",
+      "status": "available"
+    },
+    {
+      "id": "V002",
+      "name": "Polar Glide",
+      "vessel_type": "General Cargo",
+      "cruising_speed_knots": 10,
+      "maximum_speed_knots": 12,
+      "cargo_capacity_tonnes": 3000,
+      "fuel_capacity_litres": 600000,
+      "fuel_consumption_litres_per_day": 8000,
+      "operating_cost_per_day": 18000,
+      "fuel_cost_per_litre": 1.2,
+      "availability_start": "2026-11-15T00:00:00Z",
+      "availability_end": "2027-04-30T23:59:59Z",
+      "status": "available"
+    },
+    {
+      "id": "V003",
+      "name": "Titanic Resupply",
+      "vessel_type": "Heavy Lift",
+      "cruising_speed_knots": 13,
+      "maximum_speed_knots": 15,
+      "cargo_capacity_tonnes": 8000,
+      "fuel_capacity_litres": 1500000,
+      "fuel_consumption_litres_per_day": 20000,
+      "operating_cost_per_day": 40000,
+      "fuel_cost_per_litre": 1.2,
+      "availability_start": "2026-12-10T00:00:00Z",
+      "availability_end": "2027-02-28T23:59:59Z",
+      "status": "available"
+    },
+    {
+      "id": "V004",
+      "name": "Balanced Explorer",
+      "vessel_type": "Multi‑Purpose",
+      "cruising_speed_knots": 15,
+      "maximum_speed_knots": 17,
+      "cargo_capacity_tonnes": 3500,
+      "fuel_capacity_litres": 800000,
+      "fuel_consumption_litres_per_day": 11000,
+      "operating_cost_per_day": 22000,
+      "fuel_cost_per_litre": 1.2,
+      "availability_start": "2026-12-05T00:00:00Z",
+      "availability_end": "2027-03-15T23:59:59Z",
+      "status": "available"
+    }
+  ]
+}
