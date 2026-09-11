@@ -1,69 +1,92 @@
 from __future__ import annotations
 
-from decimal import Decimal
+from numbers import Real
+
+
+def _validate_non_negative(value: float, name: str) -> float:
+    if not isinstance(value, Real):
+        raise TypeError(f"{name} must be a number.")
+    if value < 0:
+        raise ValueError(f"{name} cannot be negative.")
+    return float(value)
 
 
 def calculate_fuel_consumption(
-    voyage_days: float,
-    fuel_consumption_litres_per_day: float,
+    duration_days: float,
+    consumption_litres_per_day: float | None = None,
+    fuel_consumption_litres_per_day: float | None = None,
 ) -> float:
     """
-    Calculate total fuel consumed during a voyage.
+    Calculate total fuel consumption for a voyage.
+
+    Supports both:
+        consumption_litres_per_day
+        fuel_consumption_litres_per_day
+
+    The first name is the canonical/test-facing API.
     """
 
-    if voyage_days <= 0:
-        raise ValueError("voyage_days must be positive")
+    duration_days = _validate_non_negative(duration_days, "duration_days")
 
-    if fuel_consumption_litres_per_day <= 0:
-        raise ValueError(
-            "fuel_consumption_litres_per_day must be positive"
+    if consumption_litres_per_day is None:
+        consumption_litres_per_day = fuel_consumption_litres_per_day
+
+    if consumption_litres_per_day is None:
+        raise TypeError(
+            "consumption_litres_per_day must be provided."
         )
 
-    return (
-        voyage_days
-        * fuel_consumption_litres_per_day
+    consumption_litres_per_day = _validate_non_negative(
+        consumption_litres_per_day,
+        "consumption_litres_per_day",
     )
+
+    return duration_days * consumption_litres_per_day
 
 
 def calculate_fuel_cost(
     fuel_litres: float,
-    fuel_cost_per_litre: Decimal | float,
-) -> Decimal:
-    """Calculate fuel cost."""
+    cost_per_litre: float | None = None,
+    fuel_cost_per_litre: float | None = None,
+) -> float:
+    """
+    Calculate fuel cost.
 
-    if fuel_litres <= 0:
-        raise ValueError("fuel_litres must be positive")
+    Supports both cost_per_litre and fuel_cost_per_litre.
+    """
 
-    fuel_cost = Decimal(str(fuel_cost_per_litre))
+    fuel_litres = _validate_non_negative(fuel_litres, "fuel_litres")
 
-    if fuel_cost <= 0:
-        raise ValueError(
-            "fuel_cost_per_litre must be positive"
-        )
+    if cost_per_litre is None:
+        cost_per_litre = fuel_cost_per_litre
 
-    return (
-        Decimal(str(fuel_litres))
-        * fuel_cost
+    if cost_per_litre is None:
+        raise TypeError("cost_per_litre must be provided.")
+
+    cost_per_litre = _validate_non_negative(
+        cost_per_litre,
+        "cost_per_litre",
     )
+
+    return fuel_litres * cost_per_litre
 
 
 def validate_fuel_capacity(
-    fuel_required: float,
-    fuel_capacity: float,
+    fuel_required_litres: float,
+    fuel_capacity_litres: float,
 ) -> bool:
-    """Return whether required fuel fits within vessel capacity."""
+    """
+    Return True when the vessel has sufficient fuel capacity.
+    """
 
-    if fuel_required <= 0:
-        raise ValueError("fuel_required must be positive")
+    fuel_required_litres = _validate_non_negative(
+        fuel_required_litres,
+        "fuel_required_litres",
+    )
 
-    if fuel_capacity <= 0:
-        raise ValueError("fuel_capacity must be positive")
+    fuel_capacity_litres = _validate_non_negative(
+        fuel_capacity_litres,
+        "fuel_capacity_litres",
+    )
 
-    return fuel_required <= fuel_capacity
-
-
-__all__ = [
-    "calculate_fuel_consumption",
-    "calculate_fuel_cost",
-    "validate_fuel_capacity",
-]
+    return fuel_required_litres <= fuel_capacity_litres

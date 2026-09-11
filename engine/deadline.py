@@ -130,6 +130,7 @@ def is_arrival_feasible(
 
 # Test-compatible alias.
 is_arrival_before_deadline = is_arrival_feasible
+has_arrived_before_deadline = is_arrival_feasible
 
 
 __all__ = [
@@ -139,4 +140,5 @@ __all__ = [
     "calculate_safety_margin_days",
     "is_arrival_feasible",
     "is_arrival_before_deadline",
+    "has_arrived_before_deadline",
 ]

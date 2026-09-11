@@ -8,7 +8,6 @@ from typing import Dict, Optional
 from engine import deadline as deadline_mod
 from engine import fuel as fuel_mod
 from engine import inventory as inventory_mod
-from engine import voyage as voyage_mod
 
 from engine.models import (
     ResourceInventory,
@@ -18,6 +17,8 @@ from engine.models import (
 )
 
 from .clock import SimulationClock
+from .environment import EnvironmentConditions, normal_conditions
+from .environment_events import EnvironmentTimeline
 from .vessel import SimulatedVessel
 
 
@@ -25,6 +26,14 @@ from .vessel import SimulatedVessel
 class SimulationState:
     """
     Complete runtime state of one simulated resupply voyage.
+
+    The state coordinates:
+    - simulation time
+    - vessel movement
+    - station inventory
+    - fuel consumption
+    - voyage predictions
+    - time-dependent environmental conditions
     """
 
     clock: SimulationClock
@@ -41,6 +50,8 @@ class SimulationState:
     safety_buffer_days: float = 3.0
 
     status: str = "PLANNED"
+
+    environment_timeline: Optional[EnvironmentTimeline] = None
 
     simulated_vessel: SimulatedVessel = field(
         init=False
@@ -84,6 +95,16 @@ class SimulationState:
         init=False,
     )
 
+    current_environment: EnvironmentConditions = field(
+        default_factory=normal_conditions,
+        init=False,
+    )
+
+    active_environment_event: Optional[str] = field(
+        default=None,
+        init=False,
+    )
+
     def __post_init__(self) -> None:
         if self.safety_buffer_days < 0:
             raise ValueError(
@@ -103,7 +124,14 @@ class SimulationState:
             in self.station_inventory.items()
         }
 
+        if self.environment_timeline is not None:
+            self._update_environment()
+
         self._calculate_predictions()
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     @property
     def simulation_datetime(self) -> datetime:
@@ -129,6 +157,59 @@ class SimulationState:
 
         return self.simulated_vessel.estimated_duration_days()
 
+    # ------------------------------------------------------------------
+    # Environment
+    # ------------------------------------------------------------------
+
+    def _update_environment(self) -> None:
+        """
+        Update the active environmental conditions based on
+        the current simulation datetime.
+        """
+
+        if self.environment_timeline is None:
+            self.current_environment = normal_conditions()
+            self.active_environment_event = None
+        else:
+            self.current_environment = (
+                self.environment_timeline.get_conditions(
+                    self.simulation_datetime
+                )
+            )
+
+            event = self.environment_timeline.active_event(
+                self.simulation_datetime
+            )
+
+            self.active_environment_event = (
+                event.name
+                if event is not None
+                else None
+            )
+
+        self.simulated_vessel.set_environment(
+            self.current_environment
+        )
+
+    def _next_environment_change(
+        self,
+    ) -> Optional[datetime]:
+        """
+        Return the next environmental boundary after
+        the current simulation time.
+        """
+
+        if self.environment_timeline is None:
+            return None
+
+        return self.environment_timeline.next_change_after(
+            self.simulation_datetime
+        )
+
+    # ------------------------------------------------------------------
+    # Controls
+    # ------------------------------------------------------------------
+
     def start(
         self,
         departure_datetime: Optional[datetime] = None,
@@ -141,9 +222,7 @@ class SimulationState:
         """
 
         if departure_datetime is None:
-            departure_datetime = (
-                self.clock.simulation_datetime
-            )
+            departure_datetime = self.clock.simulation_datetime
 
         if departure_datetime.tzinfo is None:
             raise ValueError(
@@ -158,11 +237,15 @@ class SimulationState:
 
         self._calculate_predictions()
 
-        self.simulated_vessel.start_voyage()
+        self.simulated_vessel.start_voyage(
+            departure_datetime
+        )
+
+        self._update_environment()
 
         self.clock.start()
 
-        self.status = "EN_ROUTE"
+        self.status = "running"
 
     def pause(self) -> None:
         """Pause the simulation."""
@@ -170,19 +253,21 @@ class SimulationState:
         self.clock.pause()
         self.simulated_vessel.pause_voyage()
 
-        if self.status == "EN_ROUTE":
-            self.status = "PAUSED"
+        if self.status == "running":
+            self.status = "paused"
 
     def resume(self) -> None:
         """Resume a paused simulation."""
 
-        if self.status != "PAUSED":
+        if self.status != "paused":
             return
 
-        self.clock.start()
+        self.clock.resume()
         self.simulated_vessel.start_voyage()
 
-        self.status = "EN_ROUTE"
+        self._update_environment()
+
+        self.status = "running"
 
     def update(
         self,
@@ -192,6 +277,11 @@ class SimulationState:
         Advance the simulation.
 
         The caller supplies elapsed simulation seconds.
+
+        If the requested timestep crosses an environmental
+        event boundary, the timestep is split so that each
+        environmental condition is applied to the correct
+        portion of the voyage.
         """
 
         if elapsed_seconds < 0:
@@ -200,27 +290,100 @@ class SimulationState:
             )
 
         if self.status not in {
-            "EN_ROUTE",
-            "PAUSED",
+            "running",
+            "paused",
         }:
             return
 
-        self.clock.advance(
-            elapsed_seconds
+        if elapsed_seconds == 0:
+            self._update_environment()
+            return
+
+        remaining_seconds = float(elapsed_seconds)
+
+        while remaining_seconds > 0:
+            self._update_environment()
+
+            segment_seconds = (
+                self._seconds_until_environment_change(
+                    remaining_seconds
+                )
+            )
+
+            if segment_seconds <= 0:
+                segment_seconds = remaining_seconds
+
+            # Apply the current environment to this segment
+            # before moving the vessel.
+            environment = self.current_environment
+
+            self.clock.advance(
+                segment_seconds
+            )
+
+            self.simulated_vessel.update(
+                segment_seconds,
+                environment=environment,
+            )
+
+            self._update_inventory()
+
+            # Fuel is now accumulated from actual simulated
+            # time and environmental conditions rather than
+            # being inferred from voyage progress.
+            self._accumulate_fuel_consumption(
+                segment_seconds,
+                environment,
+            )
+
+            remaining_seconds -= segment_seconds
+
+            if remaining_seconds < 0.000001:
+                remaining_seconds = 0.0
+
+            if self.simulated_vessel.is_complete:
+                self.status = "completed"
+                break
+
+        if (
+            self.status == "running"
+            and not self.simulated_vessel.is_complete
+        ):
+            self.status = "running"
+
+        self._update_environment()
+
+    def _seconds_until_environment_change(
+        self,
+        requested_seconds: float,
+    ) -> float:
+        """
+        Determine how many seconds can be simulated before
+        the next environmental boundary.
+
+        If there is no upcoming boundary, the complete
+        requested timestep is returned.
+        """
+
+        next_change = self._next_environment_change()
+
+        if next_change is None:
+            return requested_seconds
+
+        delta = (
+            next_change
+            - self.simulation_datetime
         )
 
-        self.simulated_vessel.update(
-            elapsed_seconds
+        seconds_until_change = delta.total_seconds()
+
+        if seconds_until_change <= 0:
+            return requested_seconds
+
+        return min(
+            requested_seconds,
+            seconds_until_change,
         )
-
-        self._update_inventory()
-        self._update_fuel_consumption()
-
-        if self.simulated_vessel.is_complete:
-            self.status = "COMPLETED"
-
-        elif self.status == "EN_ROUTE":
-            self.status = "EN_ROUTE"
 
     def reset(self) -> None:
         """Reset the entire simulation."""
@@ -238,7 +401,12 @@ class SimulationState:
             in self.station_inventory.items()
         }
 
+        self._update_environment()
         self._calculate_predictions()
+
+    # ------------------------------------------------------------------
+    # State export
+    # ------------------------------------------------------------------
 
     def get_state(self) -> dict:
         """
@@ -293,7 +461,31 @@ class SimulationState:
                 else None
             ),
             "inventory": self.current_inventory.copy(),
+            "environment": {
+                "weather_severity": (
+                    self.current_environment.weather_severity
+                ),
+                "sea_ice_severity": (
+                    self.current_environment.sea_ice_severity
+                ),
+                "current_factor": (
+                    self.current_environment.current_factor
+                ),
+                "visibility_factor": (
+                    self.current_environment.visibility_factor
+                ),
+                "overall_severity": (
+                    self.current_environment.overall_severity
+                ),
+                "active_event": (
+                    self.active_environment_event
+                ),
+            },
         }
+
+    # ------------------------------------------------------------------
+    # Predictions
+    # ------------------------------------------------------------------
 
     def _calculate_predictions(self) -> None:
         """Calculate deadline, ETA, fuel and cost predictions."""
@@ -360,6 +552,10 @@ class SimulationState:
             )
         )
 
+    # ------------------------------------------------------------------
+    # Inventory
+    # ------------------------------------------------------------------
+
     def _update_inventory(self) -> None:
         """Update projected inventory at current simulation time."""
 
@@ -379,36 +575,56 @@ class SimulationState:
             )
 
     def _initial_simulation_datetime(self) -> datetime:
-        """Return the initial simulation datetime."""
+        """Return the original simulation reference datetime."""
 
-        # The clock's reset operation returns to this point.
-        # We obtain it without depending on the clock's private
-        # implementation details by temporarily relying on its
-        # current state only when no voyage has started.
-        #
-        # In normal operation, inventory projections are based
-        # on the original simulation start.
-        current = self.clock.simulation_datetime
+        return self.clock.start_datetime
 
-        if self.status == "PLANNED":
-            return current
+    # ------------------------------------------------------------------
+    # Fuel
+    # ------------------------------------------------------------------
 
-        # The inventory projection is recalculated from the
-        # simulation's original inventory reference time.
-        #
-        # This is stored lazily the first time it is needed.
-        if not hasattr(self, "_inventory_reference_datetime"):
-            self._inventory_reference_datetime = current
+    def _accumulate_fuel_consumption(
+        self,
+        elapsed_seconds: float,
+        environment: EnvironmentConditions,
+    ) -> None:
+        """
+        Accumulate actual fuel consumed during a simulation segment.
 
-        return self._inventory_reference_datetime
+        Fuel consumption is based on:
 
-    def _update_fuel_consumption(self) -> None:
-        """Calculate fuel consumed based on voyage progress."""
+            base fuel burn
+            × elapsed simulation time
+            × environmental fuel multiplier
 
-        self.fuel_consumed_litres = (
-            self.estimated_total_fuel_litres
-            * self.simulated_vessel.progress_fraction
+        This means storms, heavy sea ice and poor visibility can
+        increase fuel consumption even when they simultaneously
+        reduce vessel speed.
+        """
+
+        if elapsed_seconds <= 0:
+            return
+
+        elapsed_days = (
+            float(elapsed_seconds)
+            / (24.0 * 60.0 * 60.0)
         )
+
+        base_fuel = (
+            self.vessel.fuel_consumption_litres_per_day
+        )
+
+        environmental_multiplier = (
+            environment.fuel_multiplier()
+        )
+
+        fuel_used = (
+            base_fuel
+            * elapsed_days
+            * environmental_multiplier
+        )
+
+        self.fuel_consumed_litres += fuel_used
 
 
 __all__ = [

@@ -1,702 +1,823 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Dict, List, Optional, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping, Optional, Sequence
 
-from . import cost as cost_mod
-from . import deadline as deadline_mod
-from . import distance as distance_mod
-from . import fuel as fuel_mod
-from . import voyage as voyage_mod
-from .models import Port, ResourceInventory, Route, Station, Vessel
+from engine.cost import calculate_operating_cost, calculate_total_cost
+from engine.fuel import calculate_fuel_consumption, validate_fuel_capacity
+from engine.voyage import calculate_voyage_duration
 
 
 @dataclass
 class VoyageOption:
-    """
-    A single evaluated resupply-voyage option.
-
-    This represents one vessel + route + departure-date combination.
-    """
-
-    vessel: Vessel
-    route: Route
-    origin_port: Port
-    destination_station: Station
-
-    departure: datetime
-    arrival: datetime
-
+    vessel_id: str
+    route_id: str
+    origin_port_id: str
+    destination_station_id: str
+    departure_datetime: datetime
+    arrival_datetime: Optional[datetime]
+    duration_days: float
     distance_km: float
-    distance_nm: float
-    voyage_duration_days: float
-
     fuel_required_litres: float
-    fuel_cost: Decimal
-    operating_cost: Decimal
-    total_cost: Decimal
-    cost_per_tonne: Decimal
-
-    safety_margin_days: float
-
-    remaining_inventory: Dict[str, float]
-
+    fuel_cost: float
+    operating_cost: float
+    total_cost: float
+    cargo_weight_tonnes: float
     feasible: bool
     rejection_reason: Optional[str] = None
+    safety_margin_days: Optional[float] = None
+    risk_score: float = 0.0
+
+    # Compatibility with tests / callers that need the actual vessel.
+    vessel: Any = None
 
 
 @dataclass
 class OptimizationResult:
-    """Result returned by the resupply optimizer."""
-
     best_option: Optional[VoyageOption]
-    alternatives: List[VoyageOption]
-    infeasible_options: List[VoyageOption]
-    all_options: List[VoyageOption]
+    alternatives: list[VoyageOption] = field(default_factory=list)
+    rejected_options: list[VoyageOption] = field(default_factory=list)
 
-    status: str
-    message: str
+    @property
+    def infeasible_options(self) -> list[VoyageOption]:
+        return self.rejected_options
 
 
-def _ensure_utc(value: datetime, name: str) -> datetime:
-    """Ensure a datetime is timezone-aware and normalize it to UTC."""
+def _get(obj: Any, *names: str, default: Any = None) -> Any:
+    """Get a value from either an object attribute or mapping key."""
+    for name in names:
+        if isinstance(obj, Mapping):
+            if name in obj:
+                return obj[name]
+        elif hasattr(obj, name):
+            return getattr(obj, name)
+
+    return default
+
+
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
 
     if value.tzinfo is None:
-        raise ValueError(
-            f"{name} must be timezone-aware"
-        )
+        return value.replace(tzinfo=timezone.utc)
 
     return value.astimezone(timezone.utc)
 
 
-def _get_route_distance(
-    route: Route,
-) -> tuple[float, float]:
-    """
-    Calculate route distance from its waypoint geometry.
+def _same_id(obj: Any, expected: Any, *names: str) -> bool:
+    value = _get(obj, *names, default=None)
 
-    Waypoints are treated as the authoritative route geometry.
-    """
+    if value is None or expected is None:
+        return False
 
-    distance_km = distance_mod.calculate_route_distance_km(
-        route.waypoints
-    )
-
-    distance_nm = distance_km / 1.852
-
-    return distance_km, distance_nm
+    return str(value) == str(expected)
 
 
-def _get_station_inventory(
-    station_id: str,
-    station_inventory: Dict[
-        str,
-        Dict[str, ResourceInventory],
-    ],
-) -> Optional[Dict[str, ResourceInventory]]:
-    """Return inventory resources for a station."""
-
-    return station_inventory.get(station_id)
-
-
-def _find_critical_date(
-    inventory: Dict[str, ResourceInventory],
-    current_datetime: datetime,
-) -> Optional[datetime]:
-    """
-    Find the earliest critical date among all station resources.
-
-    The first resource to reach its safety threshold determines
-    the station's resupply deadline.
-    """
-
-    critical_dates: List[datetime] = []
-
-    for resource in inventory.values():
-        critical_date = inventory_mod_calculate_critical_date(
-            resource,
-            current_datetime,
-        )
-
-        if critical_date is not None:
-            critical_dates.append(critical_date)
-
-    if not critical_dates:
-        return None
-
-    return min(critical_dates)
-
-
-def inventory_mod_calculate_critical_date(
-    inventory: ResourceInventory,
-    current_datetime: datetime,
-) -> Optional[datetime]:
-    """
-    Local wrapper around the inventory engine.
-
-    Kept here so the optimizer has one clear inventory calculation path.
-    """
-
-    from . import inventory as inventory_mod
-
-    return inventory_mod.calculate_critical_date(
-        inventory,
-        current_datetime,
-    )
-
-
-def _calculate_remaining_inventory(
-    inventory: Dict[str, ResourceInventory],
-    current_datetime: datetime,
-    arrival_datetime: datetime,
-) -> Dict[str, float]:
-    """Calculate projected inventory at arrival."""
-
-    from . import inventory as inventory_mod
-
-    return {
-        resource_name: inventory_mod.calculate_inventory_on_date(
-            resource,
-            current_datetime,
-            arrival_datetime,
-        )
-        for resource_name, resource in inventory.items()
-    }
-
-
-def _check_vessel_availability(
-    vessel: Vessel,
+def _availability_reason(
+    vessel: Any,
     departure: datetime,
-    arrival: datetime,
 ) -> Optional[str]:
     """Return a rejection reason if the vessel is unavailable."""
 
-    departure = _ensure_utc(
-        departure,
-        "departure",
+    departure = _as_utc(departure)
+
+    availability_start = _get(
+        vessel,
+        "availability_start",
+        "available_from",
+        "start_date",
+        default=None,
     )
 
-    arrival = _ensure_utc(
-        arrival,
-        "arrival",
+    availability_end = _get(
+        vessel,
+        "availability_end",
+        "available_until",
+        "end_date",
+        default=None,
     )
 
-    availability_start = _ensure_utc(
-        vessel.availability_start,
-        "vessel.availability_start",
-    )
+    availability_start = _as_utc(availability_start)
+    availability_end = _as_utc(availability_end)
 
-    availability_end = _ensure_utc(
-        vessel.availability_end,
-        "vessel.availability_end",
-    )
+    if (
+        availability_start is not None
+        and departure < availability_start
+    ):
+        return (
+            f"Vessel availability violation: departure "
+            f"{departure.isoformat()} is before availability start "
+            f"{availability_start.isoformat()}."
+        )
 
-    if departure < availability_start:
-        return "VESSEL_UNAVAILABLE_AT_DEPARTURE"
-
-    if departure > availability_end:
-        return "VESSEL_UNAVAILABLE_AT_DEPARTURE"
-
-    if arrival > availability_end:
-        return "VESSEL_UNAVAILABLE_FOR_COMPLETE_VOYAGE"
-
-    return None
-
-
-def _check_port_availability(
-    port: Port,
-) -> Optional[str]:
-    """Check whether a port is available for simulation."""
-
-    if not port.available_for_simulation:
-        return "PORT_UNAVAILABLE"
+    if (
+        availability_end is not None
+        and departure > availability_end
+    ):
+        return (
+            f"Vessel availability violation: departure "
+            f"{departure.isoformat()} is after availability end "
+            f"{availability_end.isoformat()}."
+        )
 
     return None
 
 
-def _check_route_match(
-    route: Route,
-    port: Port,
-    station: Station,
-) -> Optional[str]:
-    """Ensure the route connects the selected port and station."""
+def _get_inventory_deadline(
+    station_inventory: Optional[Mapping[str, Any]],
+    station_id: str,
+    current_datetime: datetime,
+    safety_buffer_days: float,
+) -> Optional[datetime]:
+    """Calculate the earliest safe arrival deadline."""
 
-    if route.origin_port_id != port.id:
-        return "ROUTE_ORIGIN_MISMATCH"
-
-    if route.destination_station_id != station.id:
-        return "ROUTE_DESTINATION_MISMATCH"
-
-    return None
-
-
-def _check_cargo_capacity(
-    vessel: Vessel,
-    cargo_weight_tonnes: float,
-) -> Optional[str]:
-    """Check whether the vessel can carry the required cargo."""
-
-    if cargo_weight_tonnes <= 0:
-        return "INVALID_CARGO_WEIGHT"
-
-    if cargo_weight_tonnes > vessel.cargo_capacity_tonnes:
-        return "INSUFFICIENT_CARGO_CAPACITY"
-
-    return None
-
-
-def _check_station_receiving_capacity(
-    station: Station,
-    cargo_weight_tonnes: float,
-) -> Optional[str]:
-    """Check whether the station can receive the proposed cargo."""
-
-    if cargo_weight_tonnes > station.receiving_capacity_tonnes:
-        return "STATION_RECEIVING_CAPACITY_EXCEEDED"
-
-    return None
-
-
-def _check_fuel_capacity(
-    vessel: Vessel,
-    fuel_required_litres: float,
-) -> Optional[str]:
-    """Check whether the vessel carries enough fuel."""
-
-    if fuel_required_litres > vessel.fuel_capacity_litres:
-        return "INSUFFICIENT_FUEL"
-
-    return None
-
-
-def _check_arrival_deadline(
-    arrival: datetime,
-    latest_safe_arrival: Optional[datetime],
-) -> Optional[str]:
-    """Check whether the voyage reaches the station before the deadline."""
-
-    if latest_safe_arrival is None:
+    if not station_inventory:
         return None
 
-    if arrival > latest_safe_arrival:
-        return "ARRIVAL_AFTER_DEADLINE"
+    inventory = station_inventory.get(station_id)
 
-    return None
+    if inventory is None:
+        return None
 
+    if isinstance(inventory, Mapping):
+        resources = list(inventory.values())
+    elif isinstance(inventory, (list, tuple)):
+        resources = list(inventory)
+    else:
+        resources = [inventory]
 
-def _score_option(
-    option: VoyageOption,
-) -> tuple:
-    """
-    Score an option for deterministic optimization.
+    deadlines: list[datetime] = []
 
-    Higher safety margin is better.
-    Lower cost is better.
-    Lower fuel consumption is better.
-    Shorter duration is better.
-    """
+    for resource in resources:
+
+        critical_date = None
+
+        if hasattr(resource, "calculate_critical_date"):
+            critical_date = resource.calculate_critical_date(
+                current_datetime
+            )
+
+        elif isinstance(resource, Mapping):
+
+            current_quantity = float(
+                resource.get("current_quantity", 0.0)
+            )
+
+            daily_consumption = float(
+                resource.get("daily_consumption", 0.0)
+            )
+
+            safety_threshold = float(
+                resource.get(
+                    "minimum_safety_threshold",
+                    0.0,
+                )
+            )
+
+            if daily_consumption > 0:
+
+                days_until_threshold = max(
+                    0.0,
+                    (
+                        current_quantity
+                        - safety_threshold
+                    )
+                    / daily_consumption,
+                )
+
+                critical_date = (
+                    current_datetime
+                    + timedelta(
+                        days=days_until_threshold
+                    )
+                )
+
+        if critical_date is not None:
+            deadlines.append(
+                _as_utc(critical_date)
+            )
+
+    if not deadlines:
+        return None
+
+    earliest_critical_date = min(deadlines)
 
     return (
-        1 if option.feasible else 0,
-        option.safety_margin_days,
-        -float(option.total_cost),
-        -option.fuel_required_litres,
-        -option.voyage_duration_days,
+        earliest_critical_date
+        - timedelta(days=safety_buffer_days)
     )
 
 
-def _sort_options(
-    options: Sequence[VoyageOption],
-) -> List[VoyageOption]:
-    """Return options sorted from best to worst."""
+def _make_rejected_option(
+    *,
+    vessel_id: str,
+    route_id: str,
+    origin_port_id: str,
+    destination_station_id: str,
+    departure: datetime,
+    distance_km: float,
+    cargo_weight_tonnes: float,
+    reason: str,
+    vessel: Any = None,
+    duration_days: float = 0.0,
+    arrival_datetime: Optional[datetime] = None,
+    fuel_required_litres: float = 0.0,
+    fuel_cost: float = 0.0,
+    operating_cost: float = 0.0,
+    total_cost: float = 0.0,
+    risk_score: float = 0.0,
+) -> VoyageOption:
 
-    return sorted(
-        options,
-        key=_score_option,
-        reverse=True,
+    return VoyageOption(
+        vessel_id=str(vessel_id),
+        route_id=str(route_id),
+        origin_port_id=str(origin_port_id),
+        destination_station_id=str(
+            destination_station_id
+        ),
+        departure_datetime=departure,
+        arrival_datetime=arrival_datetime,
+        duration_days=duration_days,
+        distance_km=distance_km,
+        fuel_required_litres=fuel_required_litres,
+        fuel_cost=fuel_cost,
+        operating_cost=operating_cost,
+        total_cost=total_cost,
+        cargo_weight_tonnes=cargo_weight_tonnes,
+        feasible=False,
+        rejection_reason=reason,
+        risk_score=risk_score,
+        vessel=vessel,
     )
 
 
 def optimize_resupply(
-    ports: Sequence[Port],
-    stations: Sequence[Station],
-    vessels: Sequence[Vessel],
-    routes: Sequence[Route],
-    departure_dates: Sequence[datetime],
-    cargo_weight_tonnes: float,
-    station_inventory: Dict[
-        str,
-        Dict[str, ResourceInventory],
-    ],
+    ports,
+    stations,
+    vessels,
+    routes,
+    departure_dates: Optional[Sequence[datetime]] = None,
+    cargo_weight_tonnes: float = 0.0,
+    station_inventory: Optional[Mapping[str, Any]] = None,
     safety_buffer_days: float = 3.0,
     current_datetime: Optional[datetime] = None,
-    max_alternatives: int = 3,
+    max_alternatives: int = 2,
+    departure_time: Optional[datetime] = None,
 ) -> OptimizationResult:
-    """
-    Evaluate and rank simulated Antarctic resupply voyages.
 
-    The optimizer considers:
-
-    - route geometry
-    - vessel speed
-    - vessel fuel consumption
-    - fuel capacity
-    - cargo capacity
-    - port availability
-    - vessel availability
-    - station receiving capacity
-    - inventory depletion
-    - safety buffer
-    - arrival deadline
-    - voyage cost
-
-    Parameters
-    ----------
-    ports:
-        Available simulated Indian departure ports.
-
-    stations:
-        Operational Antarctic research stations.
-
-    vessels:
-        Simulated resupply vessels.
-
-    routes:
-        Simulated maritime corridors.
-
-    departure_dates:
-        Candidate UTC departure times.
-
-    cargo_weight_tonnes:
-        Cargo planned for the voyage.
-
-    station_inventory:
-        Mapping:
-            station_id -> resource_name -> ResourceInventory
-
-    safety_buffer_days:
-        Required number of days before the actual critical date.
-
-    current_datetime:
-        Reference time used for inventory projection.
-        Defaults to the earliest departure date.
-
-    max_alternatives:
-        Maximum number of alternatives returned in addition
-        to the best option.
-    """
-
-    if cargo_weight_tonnes <= 0:
+    if cargo_weight_tonnes < 0:
         raise ValueError(
-            "cargo_weight_tonnes must be positive"
+            "cargo_weight_tonnes cannot be negative"
         )
 
-    if safety_buffer_days < 0:
-        raise ValueError(
-            "safety_buffer_days must be non-negative"
-        )
+    if departure_dates is None:
 
-    if max_alternatives < 0:
-        raise ValueError(
-            "max_alternatives must be non-negative"
-        )
+        if departure_time is not None:
+            departure_dates = [departure_time]
 
-    if not ports:
-        raise ValueError("At least one port is required")
+        elif current_datetime is not None:
+            departure_dates = [current_datetime]
 
-    if not stations:
-        raise ValueError("At least one station is required")
+        else:
+            departure_dates = [
+                datetime.now(timezone.utc)
+            ]
 
-    if not vessels:
-        raise ValueError("At least one vessel is required")
-
-    if not routes:
-        raise ValueError("At least one route is required")
-
-    if not departure_dates:
-        raise ValueError(
-            "At least one departure date is required"
-        )
-
-    normalized_departures = [
-        _ensure_utc(
-            departure,
-            "departure_date",
-        )
-        for departure in departure_dates
+    departure_dates = [
+        _as_utc(value)
+        for value in departure_dates
     ]
 
     if current_datetime is None:
-        current_datetime = min(normalized_departures)
-    else:
-        current_datetime = _ensure_utc(
-            current_datetime,
-            "current_datetime",
+        current_datetime = min(departure_dates)
+
+    current_datetime = _as_utc(current_datetime)
+
+    feasible_options: list[VoyageOption] = []
+    rejected_options: list[VoyageOption] = []
+
+    for route in routes:
+
+        route_id = _get(
+            route,
+            "id",
+            "route_id",
+            default="",
         )
 
-    all_options: List[VoyageOption] = []
-
-    for station in stations:
-
-        inventory = _get_station_inventory(
-            station.id,
-            station_inventory,
+        origin_port_id = _get(
+            route,
+            "origin_port_id",
+            "port_id",
+            "origin_id",
+            default=None,
         )
 
-        if inventory is None:
-            continue
-
-        critical_date = _find_critical_date(
-            inventory,
-            current_datetime,
+        destination_station_id = _get(
+            route,
+            "destination_station_id",
+            "station_id",
+            "destination_id",
+            default=None,
         )
 
-        latest_safe_arrival: Optional[datetime] = None
+        distance_km = float(
+            _get(
+                route,
+                "distance_km",
+                "distance",
+                default=0.0,
+            )
+        )
 
-        if critical_date is not None:
-            latest_safe_arrival = (
-                deadline_mod.calculate_latest_safe_arrival(
-                    critical_date,
-                    safety_buffer_days,
-                )
+        risk_score = float(
+            _get(
+                route,
+                "base_risk_factor",
+                "risk_score",
+                "risk",
+                default=0.0,
+            )
+        )
+
+        for departure in departure_dates:
+
+            departure = _as_utc(departure)
+
+            # ---------------------------------------------------------
+            # Validate origin port.
+            # ---------------------------------------------------------
+
+            port = next(
+                (
+                    p
+                    for p in ports
+                    if _same_id(
+                        p,
+                        origin_port_id,
+                        "id",
+                        "port_id",
+                    )
+                ),
+                None,
             )
 
-        for route in routes:
+            if port is None:
 
-            route_match_error = None
-
-            for port in ports:
-
-                route_match_error = _check_route_match(
-                    route,
-                    port,
-                    station,
+                rejected_options.append(
+                    _make_rejected_option(
+                        vessel_id="",
+                        route_id=route_id,
+                        origin_port_id=origin_port_id,
+                        destination_station_id=(
+                            destination_station_id
+                        ),
+                        departure=departure,
+                        distance_km=distance_km,
+                        cargo_weight_tonnes=(
+                            cargo_weight_tonnes
+                        ),
+                        reason=(
+                            f"Port {origin_port_id} "
+                            f"not found."
+                        ),
+                        risk_score=risk_score,
+                    )
                 )
 
-                if route_match_error is not None:
+                continue
+
+            port_available = _get(
+                port,
+                "available",
+                "is_available",
+                default=True,
+            )
+
+            if not port_available:
+
+                rejected_options.append(
+                    _make_rejected_option(
+                        vessel_id="",
+                        route_id=route_id,
+                        origin_port_id=origin_port_id,
+                        destination_station_id=(
+                            destination_station_id
+                        ),
+                        departure=departure,
+                        distance_km=distance_km,
+                        cargo_weight_tonnes=(
+                            cargo_weight_tonnes
+                        ),
+                        reason=(
+                            f"Port {origin_port_id} "
+                            f"unavailable."
+                        ),
+                        risk_score=risk_score,
+                    )
+                )
+
+                continue
+
+            # ---------------------------------------------------------
+            # Validate destination station.
+            # ---------------------------------------------------------
+
+            station = next(
+                (
+                    s
+                    for s in stations
+                    if _same_id(
+                        s,
+                        destination_station_id,
+                        "id",
+                        "station_id",
+                    )
+                ),
+                None,
+            )
+
+            if station is None:
+
+                rejected_options.append(
+                    _make_rejected_option(
+                        vessel_id="",
+                        route_id=route_id,
+                        origin_port_id=origin_port_id,
+                        destination_station_id=(
+                            destination_station_id
+                        ),
+                        departure=departure,
+                        distance_km=distance_km,
+                        cargo_weight_tonnes=(
+                            cargo_weight_tonnes
+                        ),
+                        reason=(
+                            f"Destination station "
+                            f"{destination_station_id} "
+                            f"not found."
+                        ),
+                        risk_score=risk_score,
+                    )
+                )
+
+                continue
+
+            # ---------------------------------------------------------
+            # Evaluate vessels.
+            # ---------------------------------------------------------
+
+            for vessel in vessels:
+
+                vessel_id = _get(
+                    vessel,
+                    "id",
+                    "vessel_id",
+                    default="",
+                )
+
+                # -----------------------------------------------------
+                # Availability.
+                # -----------------------------------------------------
+
+                availability_reason = (
+                    _availability_reason(
+                        vessel,
+                        departure,
+                    )
+                )
+
+                if availability_reason is not None:
+
+                    rejected_options.append(
+                        _make_rejected_option(
+                            vessel_id=vessel_id,
+                            route_id=route_id,
+                            origin_port_id=origin_port_id,
+                            destination_station_id=(
+                                destination_station_id
+                            ),
+                            departure=departure,
+                            distance_km=distance_km,
+                            cargo_weight_tonnes=(
+                                cargo_weight_tonnes
+                            ),
+                            reason=availability_reason,
+                            vessel=vessel,
+                            risk_score=risk_score,
+                        )
+                    )
+
                     continue
 
-                port_error = _check_port_availability(
-                    port,
+                # -----------------------------------------------------
+                # Cargo capacity.
+                # -----------------------------------------------------
+
+                cargo_capacity = float(
+                    _get(
+                        vessel,
+                        "cargo_capacity_tonnes",
+                        "cargo_capacity",
+                        "capacity_tonnes",
+                        default=0.0,
+                    )
                 )
 
-                for vessel in vessels:
+                if cargo_weight_tonnes > cargo_capacity:
 
-                    cargo_error = _check_cargo_capacity(
-                        vessel,
-                        cargo_weight_tonnes,
-                    )
-
-                    station_capacity_error = (
-                        _check_station_receiving_capacity(
-                            station,
-                            cargo_weight_tonnes,
-                        )
-                    )
-
-                    route_distance_km, route_distance_nm = (
-                        _get_route_distance(route)
-                    )
-
-                    voyage_duration_days = (
-                        voyage_mod.calculate_voyage_days(
-                            route_distance_nm,
-                            vessel.cruising_speed_knots,
-                        )
-                    )
-
-                    fuel_required = (
-                        fuel_mod.calculate_fuel_consumption(
-                            voyage_duration_days,
-                            vessel.fuel_consumption_litres_per_day,
-                        )
-                    )
-
-                    departure_error = None
-
-                    for departure in normalized_departures:
-
-                        arrival = voyage_mod.calculate_eta(
-                            departure,
-                            route_distance_nm,
-                            vessel.cruising_speed_knots,
-                        )
-
-                        vessel_error = (
-                            _check_vessel_availability(
-                                vessel,
-                                departure,
-                                arrival,
-                            )
-                        )
-
-                        fuel_error = _check_fuel_capacity(
-                            vessel,
-                            fuel_required,
-                        )
-
-                        deadline_error = (
-                            _check_arrival_deadline(
-                                arrival,
-                                latest_safe_arrival,
-                            )
-                        )
-
-                        safety_margin = 0.0
-
-                        if latest_safe_arrival is not None:
-                            safety_margin = (
-                                deadline_mod.calculate_safety_margin_days(
-                                    latest_safe_arrival,
-                                    arrival,
-                                )
-                            )
-
-                        remaining_inventory = (
-                            _calculate_remaining_inventory(
-                                inventory,
-                                current_datetime,
-                                arrival,
-                            )
-                        )
-
-                        fuel_cost = (
-                            fuel_mod.calculate_fuel_cost(
-                                fuel_required,
-                                vessel.fuel_cost_per_litre,
-                            )
-                        )
-
-                        operating_cost = (
-                            cost_mod.calculate_operating_cost(
-                                voyage_duration_days,
-                                vessel.operating_cost_per_day,
-                            )
-                        )
-
-                        total_cost = (
-                            cost_mod.calculate_total_cost(
-                                fuel_cost,
-                                operating_cost,
-                            )
-                        )
-
-                        cost_per_tonne = (
-                            cost_mod.calculate_cost_per_tonne(
-                                total_cost,
-                                cargo_weight_tonnes,
-                            )
-                        )
-
-                        rejection_reason = (
-                            cargo_error
-                            or station_capacity_error
-                            or port_error
-                            or vessel_error
-                            or fuel_error
-                            or deadline_error
-                        )
-
-                        feasible = (
-                            rejection_reason is None
-                        )
-
-                        option = VoyageOption(
-                            vessel=vessel,
-                            route=route,
-                            origin_port=port,
-                            destination_station=station,
+                    rejected_options.append(
+                        _make_rejected_option(
+                            vessel_id=vessel_id,
+                            route_id=route_id,
+                            origin_port_id=origin_port_id,
+                            destination_station_id=(
+                                destination_station_id
+                            ),
                             departure=departure,
-                            arrival=arrival,
-                            distance_km=route_distance_km,
-                            distance_nm=route_distance_nm,
-                            voyage_duration_days=voyage_duration_days,
-                            fuel_required_litres=fuel_required,
-                            fuel_cost=fuel_cost,
-                            operating_cost=operating_cost,
-                            total_cost=total_cost,
-                            cost_per_tonne=cost_per_tonne,
-                            safety_margin_days=safety_margin,
-                            remaining_inventory=remaining_inventory,
-                            feasible=feasible,
-                            rejection_reason=rejection_reason,
+                            distance_km=distance_km,
+                            cargo_weight_tonnes=(
+                                cargo_weight_tonnes
+                            ),
+                            reason=(
+                                f"Cargo weight "
+                                f"{cargo_weight_tonnes} tonnes "
+                                f"exceeds vessel capacity "
+                                f"{cargo_capacity} tonnes."
+                            ),
+                            vessel=vessel,
+                            risk_score=risk_score,
                         )
+                    )
 
-                        all_options.append(option)
+                    continue
 
-    feasible_options = [
-        option
-        for option in all_options
-        if option.feasible
-    ]
+                # -----------------------------------------------------
+                # Speed.
+                # -----------------------------------------------------
 
-    infeasible_options = [
-        option
-        for option in all_options
-        if not option.feasible
-    ]
+                speed_knots = float(
+                    _get(
+                        vessel,
+                        "cruising_speed_knots",
+                        "cruise_speed_knots",
+                        "cruise_speed",
+                        "speed_knots",
+                        default=0.0,
+                    )
+                )
 
-    ranked_feasible = _sort_options(
-        feasible_options
+                if speed_knots <= 0:
+
+                    rejected_options.append(
+                        _make_rejected_option(
+                            vessel_id=vessel_id,
+                            route_id=route_id,
+                            origin_port_id=origin_port_id,
+                            destination_station_id=(
+                                destination_station_id
+                            ),
+                            departure=departure,
+                            distance_km=distance_km,
+                            cargo_weight_tonnes=(
+                                cargo_weight_tonnes
+                            ),
+                            reason=(
+                                "Vessel speed must be "
+                                "greater than zero."
+                            ),
+                            vessel=vessel,
+                            risk_score=risk_score,
+                        )
+                    )
+
+                    continue
+
+                # -----------------------------------------------------
+                # Voyage duration.
+                # -----------------------------------------------------
+
+                duration_days = float(
+                    calculate_voyage_duration(
+                        distance_km=distance_km,
+                        speed_knots=speed_knots,
+                    )
+                )
+
+                arrival_datetime = (
+                    departure
+                    + timedelta(
+                        days=duration_days
+                    )
+                )
+
+                # -----------------------------------------------------
+                # Fuel.
+                # -----------------------------------------------------
+
+                fuel_consumption_per_day = float(
+                    _get(
+                        vessel,
+                        "fuel_consumption_litres_per_day",
+                        "fuel_consumption_l_per_day",
+                        "fuel_consumption",
+                        default=0.0,
+                    )
+                )
+
+                fuel_required = (
+                    calculate_fuel_consumption(
+                        duration_days,
+                        fuel_consumption_per_day,
+                    )
+                )
+
+                fuel_capacity = float(
+                    _get(
+                        vessel,
+                        "fuel_capacity_litres",
+                        "fuel_capacity",
+                        default=0.0,
+                    )
+                )
+
+                if not validate_fuel_capacity(
+                    fuel_required,
+                    fuel_capacity,
+                ):
+
+                    rejected_options.append(
+                        _make_rejected_option(
+                            vessel_id=vessel_id,
+                            route_id=route_id,
+                            origin_port_id=origin_port_id,
+                            destination_station_id=(
+                                destination_station_id
+                            ),
+                            departure=departure,
+                            arrival_datetime=(
+                                arrival_datetime
+                            ),
+                            duration_days=duration_days,
+                            distance_km=distance_km,
+                            cargo_weight_tonnes=(
+                                cargo_weight_tonnes
+                            ),
+                            fuel_required_litres=(
+                                fuel_required
+                            ),
+                            reason=(
+                                f"Fuel requirement "
+                                f"{fuel_required:.2f} L "
+                                f"exceeds fuel capacity "
+                                f"{fuel_capacity:.2f} L."
+                            ),
+                            vessel=vessel,
+                            risk_score=risk_score,
+                        )
+                    )
+
+                    continue
+
+                # -----------------------------------------------------
+                # Costs.
+                # -----------------------------------------------------
+
+                fuel_price = float(
+                    _get(
+                        vessel,
+                        "fuel_cost_per_litre",
+                        "fuel_price_per_litre",
+                        default=0.0,
+                    )
+                )
+
+                fuel_cost = (
+                    fuel_required * fuel_price
+                )
+
+                operating_cost_per_day = float(
+                    _get(
+                        vessel,
+                        "operating_cost_per_day",
+                        "daily_operating_cost",
+                        default=0.0,
+                    )
+                )
+
+                operating_cost = (
+                    calculate_operating_cost(
+                        duration_days,
+                        operating_cost_per_day,
+                    )
+                )
+
+                total_cost = calculate_total_cost(
+                    fuel_cost,
+                    operating_cost,
+                )
+
+                # -----------------------------------------------------
+                # Inventory deadline.
+                # -----------------------------------------------------
+
+                latest_safe_arrival = (
+                    _get_inventory_deadline(
+                        station_inventory=station_inventory,
+                        station_id=str(
+                            destination_station_id
+                        ),
+                        current_datetime=current_datetime,
+                        safety_buffer_days=(
+                            safety_buffer_days
+                        ),
+                    )
+                )
+
+                safety_margin_days = None
+
+                if latest_safe_arrival is not None:
+
+                    safety_margin_days = (
+                        (
+                            latest_safe_arrival
+                            - arrival_datetime
+                        ).total_seconds()
+                        / 86400.0
+                    )
+
+                # -----------------------------------------------------
+                # Feasible option.
+                # -----------------------------------------------------
+
+                option = VoyageOption(
+                    vessel_id=str(vessel_id),
+                    route_id=str(route_id),
+                    origin_port_id=str(
+                        origin_port_id
+                    ),
+                    destination_station_id=str(
+                        destination_station_id
+                    ),
+                    departure_datetime=departure,
+                    arrival_datetime=arrival_datetime,
+                    duration_days=duration_days,
+                    distance_km=distance_km,
+                    fuel_required_litres=fuel_required,
+                    fuel_cost=fuel_cost,
+                    operating_cost=operating_cost,
+                    total_cost=total_cost,
+                    cargo_weight_tonnes=(
+                        cargo_weight_tonnes
+                    ),
+                    feasible=True,
+                    rejection_reason=None,
+                    safety_margin_days=(
+                        safety_margin_days
+                    ),
+                    risk_score=risk_score,
+                    vessel=vessel,
+                )
+
+                feasible_options.append(option)
+
+    # -----------------------------------------------------------------
+    # Rank feasible options.
+    # -----------------------------------------------------------------
+
+    feasible_options.sort(
+        key=lambda option: (
+            (
+                option.safety_margin_days
+                if option.safety_margin_days is not None
+                else float("-inf")
+            ),
+            -option.total_cost,
+            -option.fuel_required_litres,
+            -option.duration_days,
+            -option.risk_score,
+        ),
+        reverse=True,
     )
 
-    ranked_infeasible = _sort_options(
-        infeasible_options
+    best_option = (
+        feasible_options[0]
+        if feasible_options
+        else None
     )
 
-    if not ranked_feasible:
-        if ranked_infeasible:
-            reasons = sorted(
-                {
-                    option.rejection_reason
-                    for option in ranked_infeasible
-                    if option.rejection_reason
-                }
-            )
-
-            reason_text = ", ".join(reasons)
-
-            message = (
-                "No feasible resupply plan was found. "
-                f"Candidate rejection reasons: {reason_text}."
-            )
-        else:
-            message = (
-                "No valid voyage candidates were generated."
-            )
-
-        return OptimizationResult(
-            best_option=None,
-            alternatives=[],
-            infeasible_options=ranked_infeasible,
-            all_options=all_options,
-            status="NO_FEASIBLE_PLAN",
-            message=message,
-        )
-
-    best_option = ranked_feasible[0]
-
-    alternatives = ranked_feasible[
-        1 : 1 + max_alternatives
-    ]
+    alternatives = (
+        feasible_options[
+            1 : 1 + max_alternatives
+        ]
+        if best_option is not None
+        else []
+    )
 
     return OptimizationResult(
         best_option=best_option,
         alternatives=alternatives,
-        infeasible_options=ranked_infeasible,
-        all_options=all_options,
-        status="FEASIBLE_PLAN_FOUND",
-        message=(
-            "A feasible resupply plan was found and ranked "
-            "against all evaluated candidates."
-        ),
+        rejected_options=rejected_options,
     )
-
-
-__all__ = [
-    "VoyageOption",
-    "OptimizationResult",
-    "optimize_resupply",
-]

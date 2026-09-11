@@ -95,7 +95,8 @@ def calculate_route_distance_nm(
     return km_to_nm(
         calculate_route_distance_km(waypoints)
     )
-
+route_distance_km = calculate_route_distance_km
+route_distance_nm = calculate_route_distance_nm
 
 __all__ = [
     "km_to_nm",
@@ -104,4 +105,6 @@ __all__ = [
     "haversine_distance_nm",
     "calculate_route_distance_km",
     "calculate_route_distance_nm",
+    "route_distance_km",
+    "route_distance_nm"
 ]
