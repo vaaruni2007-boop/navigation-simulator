@@ -17,7 +17,10 @@ from engine.models import (
 )
 
 from .clock import SimulationClock
-from .environment import EnvironmentConditions, normal_conditions
+from .environment import (
+    EnvironmentConditions,
+    normal_conditions,
+)
 from .environment_events import EnvironmentTimeline
 from .vessel import SimulatedVessel
 
@@ -26,15 +29,6 @@ from .vessel import SimulatedVessel
 class SimulationState:
     """
     Complete runtime state of one simulated resupply voyage.
-
-    The state coordinates:
-    - simulation time
-    - vessel movement
-    - station inventory
-    - fuel consumption
-    - voyage predictions
-    - time-dependent environmental conditions
-    - resupply risk analysis
     """
 
     clock: SimulationClock
@@ -52,23 +46,31 @@ class SimulationState:
 
     status: str = "PLANNED"
 
-    environment_timeline: Optional[EnvironmentTimeline] = None
+    environment_timeline: Optional[
+        EnvironmentTimeline
+    ] = None
 
     simulated_vessel: SimulatedVessel = field(
         init=False
     )
 
-    predicted_critical_date: Optional[datetime] = field(
+    predicted_critical_date: Optional[
+        datetime
+    ] = field(
         default=None,
         init=False,
     )
 
-    latest_safe_arrival: Optional[datetime] = field(
+    latest_safe_arrival: Optional[
+        datetime
+    ] = field(
         default=None,
         init=False,
     )
 
-    estimated_arrival: Optional[datetime] = field(
+    estimated_arrival: Optional[
+        datetime
+    ] = field(
         default=None,
         init=False,
     )
@@ -136,38 +138,37 @@ class SimulationState:
 
     @property
     def simulation_datetime(self) -> datetime:
-        """Current simulation time."""
-
         return self.clock.simulation_datetime
 
     @property
     def vessel_position(self):
-        """Current simulated vessel position."""
-
         return self.simulated_vessel.current_position
 
     @property
     def vessel_progress(self) -> float:
-        """Current voyage completion fraction."""
-
         return self.simulated_vessel.progress_fraction
 
     @property
     def estimated_voyage_duration_days(self) -> float:
-        """Estimated total voyage duration."""
-
         return self.simulated_vessel.estimated_duration_days()
+
+    @property
+    def environmental_delay_days(
+        self,
+    ) -> Optional[float]:
+        return self.simulated_vessel.delay_days
+
+    @property
+    def projected_arrival_datetime(
+        self,
+    ) -> Optional[datetime]:
+        return self.simulated_vessel.projected_arrival_datetime
 
     # ------------------------------------------------------------------
     # Environment
     # ------------------------------------------------------------------
 
     def _update_environment(self) -> None:
-        """
-        Update the active environmental conditions based on
-        the current simulation datetime.
-        """
-
         if self.environment_timeline is None:
             self.current_environment = normal_conditions()
             self.active_environment_event = None
@@ -178,8 +179,10 @@ class SimulationState:
                 )
             )
 
-            event = self.environment_timeline.active_event(
-                self.simulation_datetime
+            event = (
+                self.environment_timeline.active_event(
+                    self.simulation_datetime
+                )
             )
 
             self.active_environment_event = (
@@ -195,16 +198,13 @@ class SimulationState:
     def _next_environment_change(
         self,
     ) -> Optional[datetime]:
-        """
-        Return the next environmental boundary after
-        the current simulation time.
-        """
-
         if self.environment_timeline is None:
             return None
 
-        return self.environment_timeline.next_change_after(
-            self.simulation_datetime
+        return (
+            self.environment_timeline.next_change_after(
+                self.simulation_datetime
+            )
         )
 
     # ------------------------------------------------------------------
@@ -213,60 +213,51 @@ class SimulationState:
 
     def start(
         self,
-        departure_datetime: Optional[datetime] = None,
+        departure_datetime: Optional[
+            datetime
+        ] = None,
     ) -> None:
-        """
-        Start the simulated voyage.
-
-        If no departure time is supplied, the current
-        simulation time is used.
-        """
 
         if departure_datetime is None:
-            departure_datetime = self.clock.simulation_datetime
+            departure_datetime = (
+                self.clock.simulation_datetime
+            )
 
         if departure_datetime.tzinfo is None:
             raise ValueError(
                 "departure_datetime must be timezone-aware"
             )
 
-        self.estimated_arrival = (
-            self.simulated_vessel.estimated_arrival(
-                departure_datetime
-            )
-        )
-
-        self._calculate_predictions()
-
         self.simulated_vessel.start_voyage(
             departure_datetime
         )
 
         self._update_environment()
+        self._refresh_dynamic_eta()
+        self._calculate_predictions()
 
         self.clock.start()
 
         self.status = "running"
 
     def pause(self) -> None:
-        """Pause the simulation."""
+        if self.status != "running":
+            return
 
-        self.clock.pause()
         self.simulated_vessel.pause_voyage()
+        self.clock.pause()
 
-        if self.status == "running":
-            self.status = "paused"
+        self.status = "paused"
 
     def resume(self) -> None:
-        """Resume a paused simulation."""
-
         if self.status != "paused":
             return
 
-        self.clock.resume()
-        self.simulated_vessel.start_voyage()
-
+        self.simulated_vessel.resume_voyage()
         self._update_environment()
+        self._refresh_dynamic_eta()
+
+        self.clock.resume()
 
         self.status = "running"
 
@@ -274,109 +265,207 @@ class SimulationState:
         self,
         elapsed_seconds: float,
     ) -> None:
-        """
-        Advance the simulation.
-
-        Environmental boundaries split the timestep so that
-        each segment uses the correct environmental conditions.
-        """
 
         if elapsed_seconds < 0:
             raise ValueError(
                 "elapsed_seconds must be non-negative"
             )
 
-        if self.status not in {
-            "running",
-            "paused",
-        }:
+        # A paused or completed simulation must not advance.
+        if self.status != "running":
             return
 
         if elapsed_seconds == 0:
             self._update_environment()
+            self._refresh_dynamic_eta()
             return
 
-        remaining_seconds = float(elapsed_seconds)
+        remaining_real_seconds = float(
+            elapsed_seconds
+        )
 
-        while remaining_seconds > 0:
+        while remaining_real_seconds > 0:
             self._update_environment()
-
-            segment_seconds = (
-                self._seconds_until_environment_change(
-                    remaining_seconds
-                )
-            )
-
-            if segment_seconds <= 0:
-                segment_seconds = remaining_seconds
+            self._refresh_dynamic_eta()
 
             environment = self.current_environment
 
-            self.clock.advance(
-                segment_seconds
+            # ----------------------------------------------------------
+            # Determine how much simulated time can actually pass.
+            #
+            # elapsed_seconds is real/update time.
+            # SimulationClock may accelerate that time using its
+            # speed_multiplier.
+            # ----------------------------------------------------------
+
+            speed_multiplier = (
+                self.clock.speed_multiplier
             )
 
+            if speed_multiplier <= 0:
+                raise RuntimeError(
+                    "Simulation clock speed multiplier must be greater than zero."
+                )
+
+            requested_simulation_seconds = (
+                remaining_real_seconds
+                * speed_multiplier
+            )
+
+            # ----------------------------------------------------------
+            # Stop exactly at the next environmental boundary.
+            # ----------------------------------------------------------
+
+            environment_boundary_seconds = (
+                self._simulation_seconds_until_environment_change()
+            )
+
+            if environment_boundary_seconds is not None:
+                requested_simulation_seconds = min(
+                    requested_simulation_seconds,
+                    environment_boundary_seconds,
+                )
+
+            # ----------------------------------------------------------
+            # Stop exactly when the vessel reaches Antarctica.
+            #
+            # distance / knots = hours
+            # ----------------------------------------------------------
+
+            if (
+                self.simulated_vessel.is_active
+                and not self.simulated_vessel.is_complete
+            ):
+                effective_speed = (
+                    self.simulated_vessel.effective_speed_knots
+                )
+
+                hours_to_destination = (
+                    self.simulated_vessel.distance_remaining_nm
+                    / effective_speed
+                )
+
+                vessel_remaining_seconds = (
+                    hours_to_destination
+                    * 3600.0
+                )
+
+                requested_simulation_seconds = min(
+                    requested_simulation_seconds,
+                    vessel_remaining_seconds,
+                )
+
+            # Nothing meaningful can advance.
+            if requested_simulation_seconds <= 0:
+                break
+
+            # Convert simulated time back to real update time so
+            # SimulationClock applies its speed multiplier exactly once.
+            segment_real_seconds = (
+                requested_simulation_seconds
+                / speed_multiplier
+            )
+
+            before_datetime = (
+                self.clock.simulation_datetime
+            )
+
+            # Advance the authoritative simulation clock.
+            self.clock.advance(
+                segment_real_seconds
+            )
+
+            actual_simulation_seconds = (
+                self.clock.simulation_datetime
+                - before_datetime
+            ).total_seconds()
+
+            # Advance vessel using the SAME simulated duration.
             self.simulated_vessel.update(
-                segment_seconds,
+                actual_simulation_seconds,
                 environment=environment,
             )
 
             self._update_inventory()
 
-            self._accumulate_fuel_consumption(
-                segment_seconds,
-                environment,
+            # Vessel is authoritative for actual fuel usage.
+            self.fuel_consumed_litres = (
+                self.simulated_vessel.fuel_used_litres()
             )
 
-            remaining_seconds -= segment_seconds
+            self._update_environment()
+            self._refresh_dynamic_eta()
 
-            if remaining_seconds < 0.000001:
-                remaining_seconds = 0.0
+            remaining_real_seconds -= (
+                segment_real_seconds
+            )
+
+            if remaining_real_seconds < 0.000001:
+                remaining_real_seconds = 0.0
+
+            # ----------------------------------------------------------
+            # If vessel arrived, stop immediately.
+            #
+            # The clock has already been capped to the exact arrival
+            # time, so simulation_datetime == arrival_datetime.
+            # ----------------------------------------------------------
 
             if self.simulated_vessel.is_complete:
                 self.status = "completed"
+
+                self.fuel_consumed_litres = (
+                    self.simulated_vessel.fuel_used_litres()
+                )
+
                 break
 
-        if (
-            self.status == "running"
-            and not self.simulated_vessel.is_complete
-        ):
-            self.status = "running"
-
         self._update_environment()
+        self._refresh_dynamic_eta()
 
-    def _seconds_until_environment_change(
+        self.fuel_consumed_litres = (
+            self.simulated_vessel.fuel_used_litres()
+        )
+
+    def _simulation_seconds_until_environment_change(
         self,
-        requested_seconds: float,
-    ) -> float:
+    ) -> Optional[float]:
         """
-        Determine how many seconds can be simulated before
-        the next environmental boundary.
+        Return the number of simulated seconds until the next
+        environmental event boundary.
+
+        Returns None when there is no upcoming event.
         """
 
-        next_change = self._next_environment_change()
+        next_change = (
+            self._next_environment_change()
+        )
 
         if next_change is None:
-            return requested_seconds
+            return None
 
         delta = (
             next_change
             - self.simulation_datetime
         )
 
-        seconds_until_change = delta.total_seconds()
-
-        if seconds_until_change <= 0:
-            return requested_seconds
-
-        return min(
-            requested_seconds,
-            seconds_until_change,
+        seconds_until_change = (
+            delta.total_seconds()
         )
 
-    def reset(self) -> None:
-        """Reset the entire simulation."""
+        if seconds_until_change <= 0:
+            return None
 
+        return seconds_until_change
+
+    def _refresh_dynamic_eta(self) -> None:
+        projected_eta = (
+            self.simulated_vessel.projected_arrival_datetime
+        )
+
+        if projected_eta is not None:
+            self.estimated_arrival = projected_eta
+
+    def reset(self) -> None:
         self.clock.reset()
         self.simulated_vessel.reset()
 
@@ -397,14 +486,9 @@ class SimulationState:
     # Risk analysis
     # ------------------------------------------------------------------
 
-    def calculate_safety_margin_days(self) -> Optional[float]:
-        """
-        Calculate the current arrival safety margin.
-
-        Positive  = arrival is before the safe deadline.
-        Zero       = arrival is exactly at the safe deadline.
-        Negative   = arrival is after the safe deadline.
-        """
+    def calculate_safety_margin_days(
+        self,
+    ) -> Optional[float]:
 
         if (
             self.latest_safe_arrival is None
@@ -418,11 +502,9 @@ class SimulationState:
         )
 
     @property
-    def arrival_feasible(self) -> Optional[bool]:
-        """
-        Return whether the currently estimated arrival
-        meets the safe-arrival deadline.
-        """
+    def arrival_feasible(
+        self,
+    ) -> Optional[bool]:
 
         if (
             self.latest_safe_arrival is None
@@ -437,19 +519,6 @@ class SimulationState:
 
     @property
     def arrival_risk_status(self) -> str:
-        """
-        Return a high-level arrival risk classification.
-
-        SAFE:
-            ETA is comfortably before the deadline.
-
-        AT_RISK:
-            ETA is within the safety deadline but has little
-            remaining margin.
-
-        CRITICAL:
-            ETA is already beyond the safe-arrival deadline.
-        """
 
         margin = self.calculate_safety_margin_days()
 
@@ -464,10 +533,9 @@ class SimulationState:
 
         return "SAFE"
 
-    def get_resource_risk(self) -> Dict[str, dict]:
-        """
-        Return risk information for every station resource.
-        """
+    def get_resource_risk(
+        self,
+    ) -> Dict[str, dict]:
 
         result: Dict[str, dict] = {}
 
@@ -510,12 +578,12 @@ class SimulationState:
 
             if days_until_critical < 0:
                 resource_status = "CRITICAL"
+
             elif self.estimated_arrival is not None:
-                if (
-                    self.estimated_arrival
-                    > latest_safe_arrival
-                ):
+
+                if self.estimated_arrival > latest_safe_arrival:
                     resource_status = "CRITICAL"
+
                 elif (
                     (
                         latest_safe_arrival
@@ -525,8 +593,10 @@ class SimulationState:
                     <= self.safety_buffer_days
                 ):
                     resource_status = "AT_RISK"
+
                 else:
                     resource_status = "SAFE"
+
             else:
                 resource_status = "SAFE"
 
@@ -538,9 +608,7 @@ class SimulationState:
                 ),
                 "daily_consumption": resource.daily_consumption,
                 "critical_date": critical_date.isoformat(),
-                "latest_safe_arrival": (
-                    latest_safe_arrival.isoformat()
-                ),
+                "latest_safe_arrival": latest_safe_arrival.isoformat(),
                 "status": resource_status,
                 "days_until_critical": days_until_critical,
             }
@@ -548,10 +616,6 @@ class SimulationState:
         return result
 
     def get_risk_summary(self) -> dict:
-        """
-        Return a complete mission-level risk summary.
-        """
-
         resource_risk = self.get_resource_risk()
 
         statuses = [
@@ -570,9 +634,8 @@ class SimulationState:
             "overall_status": overall_status,
             "arrival_status": self.arrival_risk_status,
             "arrival_feasible": self.arrival_feasible,
-            "safety_margin_days": (
-                self.calculate_safety_margin_days()
-            ),
+            "safety_margin_days": self.calculate_safety_margin_days(),
+            "delay_days": self.environmental_delay_days,
             "estimated_arrival": (
                 self.estimated_arrival.isoformat()
                 if self.estimated_arrival
@@ -596,10 +659,6 @@ class SimulationState:
     # ------------------------------------------------------------------
 
     def get_state(self) -> dict:
-        """
-        Return a JSON-serializable representation
-        of the current simulation state.
-        """
 
         return {
             "status": self.status,
@@ -623,8 +682,12 @@ class SimulationState:
                 "longitude": self.vessel_position.longitude,
             },
             "vessel_progress": self.vessel_progress,
-            "fuel_consumed_litres": (
-                self.fuel_consumed_litres
+            "fuel_consumed_litres": self.fuel_consumed_litres,
+            "fuel_remaining_litres": (
+                self.simulated_vessel.fuel_remaining_litres
+            ),
+            "fuel_remaining_percent": (
+                self.simulated_vessel.fuel_remaining_percent()
             ),
             "estimated_total_fuel_litres": (
                 self.estimated_total_fuel_litres
@@ -647,6 +710,7 @@ class SimulationState:
                 if self.estimated_arrival
                 else None
             ),
+            "delay_days": self.environmental_delay_days,
             "inventory": self.current_inventory.copy(),
             "environment": {
                 "weather_severity": (
@@ -676,7 +740,6 @@ class SimulationState:
     # ------------------------------------------------------------------
 
     def _calculate_predictions(self) -> None:
-        """Calculate deadline, ETA, fuel and cost predictions."""
 
         current_datetime = (
             self.clock.simulation_datetime
@@ -693,9 +756,7 @@ class SimulationState:
             )
 
             if critical_date is not None:
-                critical_dates.append(
-                    critical_date
-                )
+                critical_dates.append(critical_date)
 
         if critical_dates:
             self.predicted_critical_date = min(
@@ -726,11 +787,9 @@ class SimulationState:
 
         from engine import cost as cost_mod
 
-        operating_cost = (
-            cost_mod.calculate_operating_cost(
-                self.estimated_voyage_duration_days,
-                self.vessel.operating_cost_per_day,
-            )
+        operating_cost = cost_mod.calculate_operating_cost(
+            self.estimated_voyage_duration_days,
+            self.vessel.operating_cost_per_day,
         )
 
         self.estimated_total_cost = (
@@ -745,7 +804,6 @@ class SimulationState:
     # ------------------------------------------------------------------
 
     def _update_inventory(self) -> None:
-        """Update projected inventory at current simulation time."""
 
         current_datetime = (
             self.clock.simulation_datetime
@@ -762,9 +820,9 @@ class SimulationState:
                 current_datetime,
             )
 
-    def _initial_simulation_datetime(self) -> datetime:
-        """Return the original simulation reference datetime."""
-
+    def _initial_simulation_datetime(
+        self,
+    ) -> datetime:
         return self.clock.start_datetime
 
     # ------------------------------------------------------------------
@@ -776,9 +834,6 @@ class SimulationState:
         elapsed_seconds: float,
         environment: EnvironmentConditions,
     ) -> None:
-        """
-        Accumulate actual fuel consumed during a simulation segment.
-        """
 
         if elapsed_seconds <= 0:
             return

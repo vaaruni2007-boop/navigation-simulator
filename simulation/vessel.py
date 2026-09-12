@@ -5,7 +5,10 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from engine.voyage import calculate_voyage_days, calculate_eta
-from simulation.environment import EnvironmentConditions, normal_conditions
+from simulation.environment import (
+    EnvironmentConditions,
+    normal_conditions,
+)
 
 
 @dataclass
@@ -13,12 +16,13 @@ class SimulatedVessel:
     """
     Runtime representation of a vessel travelling along a simulated route.
 
-    Supports the existing project API:
-
-        SimulatedVessel(vessel=..., route=...)
-
-    while also supporting direct construction for lower-level simulation
-    tests and environment modelling.
+    The vessel tracks:
+    - distance travelled
+    - current environment
+    - fuel consumption
+    - planned ETA
+    - dynamically projected ETA
+    - pause/resume state
     """
 
     vessel: Any = None
@@ -94,6 +98,10 @@ class SimulatedVessel:
         if self.environment is None:
             self.environment = normal_conditions()
 
+    # ------------------------------------------------------------------
+    # Model helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _get(obj: Any, *names: str, default: Any = None) -> Any:
         if obj is None:
@@ -126,7 +134,6 @@ class SimulatedVessel:
                 default=0.0,
             )
 
-            # Project route distances are stored in kilometres.
             self.total_distance_nm = (
                 float(distance_km) * 0.539956803
             )
@@ -154,7 +161,9 @@ class SimulatedVessel:
             )
 
         if self.fuel_remaining_litres is None:
-            self.fuel_remaining_litres = self.fuel_capacity_litres
+            self.fuel_remaining_litres = (
+                self.fuel_capacity_litres
+            )
 
         if self.fuel_consumption_litres_per_day is None:
             self.fuel_consumption_litres_per_day = float(
@@ -174,6 +183,10 @@ class SimulatedVessel:
             route=route,
         )
 
+    # ------------------------------------------------------------------
+    # Progress
+    # ------------------------------------------------------------------
+
     @property
     def progress(self) -> float:
         if self.total_distance_nm == 0:
@@ -181,13 +194,12 @@ class SimulatedVessel:
 
         return min(
             1.0,
-            self.distance_travelled_nm / self.total_distance_nm,
+            self.distance_travelled_nm
+            / self.total_distance_nm,
         )
 
     @property
     def progress_fraction(self) -> float:
-        """Backwards-compatible progress property."""
-
         return self.progress
 
     @property
@@ -198,16 +210,24 @@ class SimulatedVessel:
     def distance_remaining_nm(self) -> float:
         return max(
             0.0,
-            self.total_distance_nm - self.distance_travelled_nm,
+            self.total_distance_nm
+            - self.distance_travelled_nm,
         )
 
     @property
     def is_complete(self) -> bool:
-        return self.distance_travelled_nm >= self.total_distance_nm
+        return (
+            self.distance_travelled_nm
+            >= self.total_distance_nm
+        )
 
     @property
     def is_active(self) -> bool:
         return self.status == "EN_ROUTE"
+
+    # ------------------------------------------------------------------
+    # Environment
+    # ------------------------------------------------------------------
 
     @property
     def effective_speed_knots(self) -> float:
@@ -222,14 +242,13 @@ class SimulatedVessel:
             * self.environment.fuel_multiplier()
         )
 
+    # ------------------------------------------------------------------
+    # Position
+    # ------------------------------------------------------------------
+
     @property
     def current_position(self):
-        """
-        Current interpolated position along the route.
-
-        Returns a simple latitude/longitude object compatible with
-        SimulationState.
-        """
+        """Current interpolated position along the route."""
 
         if self.route is None:
             return self._position_from_direct_coordinates()
@@ -249,7 +268,6 @@ class SimulatedVessel:
         if self.progress >= 1:
             return self._waypoint_position(waypoints[-1])
 
-        # Calculate position by interpolating through route segments.
         segment_lengths = []
 
         for index in range(len(waypoints) - 1):
@@ -279,7 +297,8 @@ class SimulatedVessel:
             return self._waypoint_position(waypoints[0])
 
         total_length = sum(
-            length for _, length in segment_lengths
+            length
+            for _, length in segment_lengths
         )
 
         target = self.progress * total_length
@@ -309,14 +328,22 @@ class SimulatedVessel:
                     second[1] - first[1]
                 ) * fraction
 
-                return self._make_position(lat, lon)
+                return self._make_position(
+                    lat,
+                    lon,
+                )
 
             travelled += segment_length
 
-        return self._waypoint_position(waypoints[-1])
+        return self._waypoint_position(
+            waypoints[-1]
+        )
 
     @staticmethod
-    def _make_position(latitude: float, longitude: float):
+    def _make_position(
+        latitude: float,
+        longitude: float,
+    ):
         return type(
             "Position",
             (),
@@ -329,14 +356,26 @@ class SimulatedVessel:
     @classmethod
     def _waypoint_coordinates(cls, waypoint):
         if isinstance(waypoint, dict):
-            lat = waypoint.get("latitude", waypoint.get("lat"))
-            lon = waypoint.get("longitude", waypoint.get("lon"))
+            lat = waypoint.get(
+                "latitude",
+                waypoint.get("lat"),
+            )
+            lon = waypoint.get(
+                "longitude",
+                waypoint.get("lon"),
+            )
 
             if lat is not None and lon is not None:
                 return float(lat), float(lon)
 
-        if isinstance(waypoint, (list, tuple)) and len(waypoint) >= 2:
-            return float(waypoint[0]), float(waypoint[1])
+        if (
+            isinstance(waypoint, (list, tuple))
+            and len(waypoint) >= 2
+        ):
+            return (
+                float(waypoint[0]),
+                float(waypoint[1]),
+            )
 
         lat = getattr(
             waypoint,
@@ -357,10 +396,15 @@ class SimulatedVessel:
 
     @classmethod
     def _waypoint_position(cls, waypoint):
-        coordinates = cls._waypoint_coordinates(waypoint)
+        coordinates = cls._waypoint_coordinates(
+            waypoint
+        )
 
         if coordinates is None:
-            return cls._make_position(0.0, 0.0)
+            return cls._make_position(
+                0.0,
+                0.0,
+            )
 
         return cls._make_position(
             coordinates[0],
@@ -386,6 +430,10 @@ class SimulatedVessel:
             float(latitude),
             float(longitude),
         )
+
+    # ------------------------------------------------------------------
+    # Voyage calculations
+    # ------------------------------------------------------------------
 
     def estimated_duration_days(self) -> float:
         if self.total_distance_nm == 0:
@@ -413,14 +461,131 @@ class SimulatedVessel:
             self.effective_speed_knots,
         )
 
+    # ------------------------------------------------------------------
+    # Dynamic ETA
+    # ------------------------------------------------------------------
+
+    @property
+    def planned_duration_days(self) -> float:
+        """Original planned voyage duration using normal conditions."""
+
+        if self.total_distance_nm == 0:
+            return 0.0
+
+        normal_speed = (
+            normal_conditions().effective_speed(
+                self.cruise_speed_knots
+            )
+        )
+
+        return calculate_voyage_days(
+            self.total_distance_nm,
+            normal_speed,
+        )
+
+    @property
+    def planned_arrival_datetime(
+        self,
+    ) -> Optional[datetime]:
+        """Original planned ETA under normal conditions."""
+
+        if self.departure_datetime is None:
+            return None
+
+        return self.departure_datetime + timedelta(
+            days=self.planned_duration_days
+        )
+
+    @property
+    def projected_remaining_duration_days(
+        self,
+    ) -> float:
+        """Remaining voyage duration at the current effective speed."""
+
+        if self.is_complete:
+            return 0.0
+
+        if self.distance_remaining_nm <= 0:
+            return 0.0
+
+        return (
+            self.distance_remaining_nm
+            / self.effective_speed_knots
+            / 24.0
+        )
+
+    @property
+    def projected_arrival_datetime(
+        self,
+    ) -> Optional[datetime]:
+        """Current dynamic projected arrival."""
+
+        if self.current_datetime is None:
+            return self.planned_arrival_datetime
+
+        if self.is_complete:
+            return self.current_datetime
+
+        return self.current_datetime + timedelta(
+            days=self.projected_remaining_duration_days
+        )
+
+    @property
+    def dynamic_eta(self) -> Optional[datetime]:
+        return self.projected_arrival_datetime
+
+    @property
+    def delay_days(self) -> Optional[float]:
+        """Projected delay relative to the original normal-condition plan."""
+
+        planned_arrival = self.planned_arrival_datetime
+        projected_arrival = self.projected_arrival_datetime
+
+        if (
+            planned_arrival is None
+            or projected_arrival is None
+        ):
+            return None
+
+        delay = (
+            projected_arrival
+            - planned_arrival
+        ).total_seconds() / 86400.0
+
+        return max(
+            0.0,
+            delay,
+        )
+
+    # ------------------------------------------------------------------
+    # Voyage controls
+    # ------------------------------------------------------------------
+
     def start_voyage(
         self,
         departure_datetime: datetime,
-        environment: Optional[EnvironmentConditions] = None,
+        environment: Optional[
+            EnvironmentConditions
+        ] = None,
     ):
         if self.status == "EN_ROUTE":
             raise ValueError(
                 "Vessel is already en route."
+            )
+
+        if self.status == "PAUSED":
+            raise ValueError(
+                "Use resume_voyage() to resume a paused vessel."
+            )
+
+        if self.status == "COMPLETED":
+            raise ValueError(
+                "Cannot start a completed vessel. Reset it first."
+            )
+
+        if departure_datetime.tzinfo is None:
+            raise ValueError(
+                "departure_datetime must be timezone-aware."
             )
 
         if environment is not None:
@@ -435,13 +600,37 @@ class SimulatedVessel:
 
         self.status = "EN_ROUTE"
 
-    def start(self, departure_datetime: datetime):
-        self.start_voyage(departure_datetime)
+    def start(
+        self,
+        departure_datetime: datetime,
+    ):
+        self.start_voyage(
+            departure_datetime
+        )
+
+    def pause_voyage(self):
+        if self.status != "EN_ROUTE":
+            return
+
+        self.status = "PAUSED"
+
+    def resume_voyage(self):
+        if self.status != "PAUSED":
+            return
+
+        self.status = "EN_ROUTE"
+
+        if not self.is_complete:
+            self.arrival_datetime = (
+                self.projected_arrival_datetime
+            )
 
     def advance(
         self,
         elapsed_hours: float,
-        environment: Optional[EnvironmentConditions] = None,
+        environment: Optional[
+            EnvironmentConditions
+        ] = None,
     ):
         if elapsed_hours < 0:
             raise ValueError(
@@ -454,53 +643,74 @@ class SimulatedVessel:
         if environment is not None:
             self.environment = environment
 
-        if self.is_complete:
-            self.status = "COMPLETED"
-            return
-
-        effective_speed = self.effective_speed_knots
-
-        # Knots = nautical miles per hour.
-        distance_moved = (
-            effective_speed * elapsed_hours
-        )
-
-        self.distance_travelled_nm = min(
-            self.total_distance_nm,
-            self.distance_travelled_nm + distance_moved,
-        )
-
-        fuel_used = (
-            self.current_fuel_burn_per_day
-            * elapsed_hours
-            / 24.0
-        )
-
-        self.fuel_remaining_litres = max(
-            0.0,
-            self.fuel_remaining_litres - fuel_used,
-        )
-
-        if self.current_datetime is not None:
-            self.current_datetime += timedelta(
-                hours=elapsed_hours
+        if self.current_datetime is None:
+            raise RuntimeError(
+                "Vessel must have a current datetime before advancing."
             )
 
         if self.is_complete:
             self.status = "COMPLETED"
             self.arrival_datetime = self.current_datetime
+            return
+
+        effective_speed = self.effective_speed_knots
+
+        # Calculate the exact amount of time required to reach
+        # the destination. This prevents a large update tick from
+        # moving the vessel beyond its true arrival time.
+        hours_to_destination = (
+            self.distance_remaining_nm
+            / effective_speed
+        )
+
+        actual_elapsed_hours = min(
+            elapsed_hours,
+            hours_to_destination,
+        )
+
+        distance_moved = (
+            effective_speed
+            * actual_elapsed_hours
+        )
+
+        self.distance_travelled_nm = min(
+            self.total_distance_nm,
+            self.distance_travelled_nm
+            + distance_moved,
+        )
+
+        fuel_used = (
+            self.current_fuel_burn_per_day
+            * actual_elapsed_hours
+            / 24.0
+        )
+
+        self.fuel_remaining_litres = max(
+            0.0,
+            self.fuel_remaining_litres
+            - fuel_used,
+        )
+
+        self.current_datetime += timedelta(
+            hours=actual_elapsed_hours
+        )
+
+        if self.is_complete:
+            self.status = "COMPLETED"
+            self.arrival_datetime = self.current_datetime
+        else:
+            self.arrival_datetime = (
+                self.projected_arrival_datetime
+            )
 
     def update(
         self,
         elapsed_seconds: float,
-        environment: Optional[EnvironmentConditions] = None,
+        environment: Optional[
+            EnvironmentConditions
+        ] = None,
     ):
-        """
-        Advance simulation by seconds.
-
-        SimulationState.update() uses seconds, while the lower-level
-        advance() method uses hours.
-        """
+        """Advance simulation by seconds."""
 
         if elapsed_seconds < 0:
             raise ValueError(
@@ -518,12 +728,26 @@ class SimulatedVessel:
     ):
         self.environment = environment
 
+        if (
+            self.status == "EN_ROUTE"
+            and not self.is_complete
+        ):
+            self.arrival_datetime = (
+                self.projected_arrival_datetime
+            )
+
+    # ------------------------------------------------------------------
+    # Reset / fuel
+    # ------------------------------------------------------------------
+
     def reset(self):
         self.distance_travelled_nm = 0.0
         self.current_datetime = None
         self.departure_datetime = None
         self.arrival_datetime = None
-        self.fuel_remaining_litres = self.fuel_capacity_litres
+        self.fuel_remaining_litres = (
+            self.fuel_capacity_litres
+        )
         self.status = "PLANNED"
 
     def fuel_used_litres(self) -> float:
@@ -540,3 +764,8 @@ class SimulatedVessel:
             self.fuel_remaining_litres
             / self.fuel_capacity_litres
         ) * 100.0
+
+
+__all__ = [
+    "SimulatedVessel",
+]

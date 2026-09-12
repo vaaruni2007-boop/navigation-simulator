@@ -101,6 +101,34 @@ def make_route(
 
 
 def make_inventory():
+    """
+    Generic test inventory with enough runway for normal optimizer tests.
+
+    Deadline-specific behavior is tested separately using
+    make_expiring_inventory().
+    """
+    return {
+        "S001": {
+            "diesel": ResourceInventory(
+                resource_name="diesel",
+                current_quantity=300_000.0,
+                unit="litres",
+                daily_consumption=1_000.0,
+                minimum_safety_threshold=20_000.0,
+                required_resupply_quantity=50_000.0,
+            )
+        }
+    }
+
+
+def make_expiring_inventory():
+    """
+    Inventory intentionally close to its safety deadline.
+
+    100,000 - 20,000 = 80,000 L usable above threshold.
+    At 2,000 L/day, the raw deadline is 40 days after Oct 1.
+    With a 3-day safety buffer, the effective deadline is Nov 7.
+    """
     return {
         "S001": {
             "diesel": ResourceInventory(
@@ -149,6 +177,49 @@ def test_optimizer_finds_feasible_option():
 
     assert result.best_option is not None
     assert result.best_option.feasible is True
+
+
+def test_optimizer_rejects_late_arrival_due_to_inventory_deadline():
+    port = make_port()
+    station = make_station()
+    vessel = make_vessel()
+    route = make_route()
+
+    current = datetime(
+        2026,
+        10,
+        1,
+        tzinfo=timezone.utc,
+    )
+
+    departure = datetime(
+        2026,
+        11,
+        1,
+        tzinfo=timezone.utc,
+    )
+
+    result = optimize_resupply(
+        ports=[port],
+        stations=[station],
+        vessels=[vessel],
+        routes=[route],
+        departure_dates=[departure],
+        cargo_weight_tonnes=1000.0,
+        station_inventory=make_expiring_inventory(),
+        safety_buffer_days=3.0,
+        current_datetime=current,
+    )
+
+    assert result.best_option is None
+    assert len(result.infeasible_options) > 0
+
+    assert any(
+        option.rejection_reason
+        and "inventory safety deadline"
+        in option.rejection_reason.lower()
+        for option in result.infeasible_options
+    )
 
 
 def test_optimizer_rejects_overweight_cargo():
@@ -363,11 +434,7 @@ def test_optimizer_prefers_lower_cost_when_other_factors_equal():
     )
 
     assert result.best_option is not None
-
-    assert (
-        result.best_option.vessel.id
-        == "V002"
-    )
+    assert result.best_option.vessel.id == "V002"
 
 
 def test_optimizer_returns_alternatives():

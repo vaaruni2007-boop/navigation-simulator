@@ -29,7 +29,6 @@ class VoyageOption:
     safety_margin_days: Optional[float] = None
     risk_score: float = 0.0
 
-    # Compatibility with tests / callers that need the actual vessel.
     vessel: Any = None
 
 
@@ -131,7 +130,19 @@ def _get_inventory_deadline(
     current_datetime: datetime,
     safety_buffer_days: float,
 ) -> Optional[datetime]:
-    """Calculate the earliest safe arrival deadline."""
+    """
+    Calculate the earliest safe arrival deadline for a station.
+
+    The deadline is the earliest time at which any tracked resource
+    reaches its minimum safety threshold, minus the requested safety
+    buffer.
+
+    Supports:
+    - ResourceInventory-like objects
+    - mappings containing resource data
+    - lists/tuples of resources
+    - nested station/resource mappings
+    """
 
     if not station_inventory:
         return None
@@ -152,52 +163,83 @@ def _get_inventory_deadline(
 
     for resource in resources:
 
-        critical_date = None
+        # Handle nested structures defensively.
+        if isinstance(resource, Mapping):
+            nested_values = list(resource.values())
 
-        if hasattr(resource, "calculate_critical_date"):
-            critical_date = resource.calculate_critical_date(
-                current_datetime
-            )
+            # If this mapping itself contains inventory fields,
+            # treat it as one resource rather than expanding it.
+            if (
+                "current_quantity" in resource
+                or "daily_consumption" in resource
+                or "minimum_safety_threshold" in resource
+            ):
+                resource_items = [resource]
+            else:
+                resource_items = nested_values
+        else:
+            resource_items = [resource]
 
-        elif isinstance(resource, Mapping):
+        for item in resource_items:
 
-            current_quantity = float(
-                resource.get("current_quantity", 0.0)
-            )
+            critical_date = None
 
-            daily_consumption = float(
-                resource.get("daily_consumption", 0.0)
-            )
-
-            safety_threshold = float(
-                resource.get(
-                    "minimum_safety_threshold",
-                    0.0,
-                )
-            )
-
-            if daily_consumption > 0:
-
-                days_until_threshold = max(
-                    0.0,
-                    (
-                        current_quantity
-                        - safety_threshold
-                    )
-                    / daily_consumption,
-                )
-
-                critical_date = (
+            # Existing/custom inventory objects may expose their own
+            # critical-date calculation.
+            if hasattr(item, "calculate_critical_date"):
+                critical_date = item.calculate_critical_date(
                     current_datetime
-                    + timedelta(
-                        days=days_until_threshold
-                    )
                 )
 
-        if critical_date is not None:
-            deadlines.append(
-                _as_utc(critical_date)
-            )
+            else:
+                current_quantity = _get(
+                    item,
+                    "current_quantity",
+                    default=None,
+                )
+
+                daily_consumption = _get(
+                    item,
+                    "daily_consumption",
+                    default=None,
+                )
+
+                safety_threshold = _get(
+                    item,
+                    "minimum_safety_threshold",
+                    default=None,
+                )
+
+                if (
+                    current_quantity is not None
+                    and daily_consumption is not None
+                    and safety_threshold is not None
+                ):
+                    current_quantity = float(current_quantity)
+                    daily_consumption = float(daily_consumption)
+                    safety_threshold = float(safety_threshold)
+
+                    # Already at/below the safety threshold:
+                    # the station is already critical.
+                    if current_quantity <= safety_threshold:
+                        critical_date = current_datetime
+
+                    elif daily_consumption > 0:
+                        days_until_threshold = (
+                            current_quantity - safety_threshold
+                        ) / daily_consumption
+
+                        critical_date = (
+                            current_datetime
+                            + timedelta(
+                                days=days_until_threshold
+                            )
+                        )
+
+            if critical_date is not None:
+                deadlines.append(
+                    _as_utc(critical_date)
+                )
 
     if not deadlines:
         return None
@@ -228,6 +270,7 @@ def _make_rejected_option(
     operating_cost: float = 0.0,
     total_cost: float = 0.0,
     risk_score: float = 0.0,
+    safety_margin_days: Optional[float] = None,
 ) -> VoyageOption:
 
     return VoyageOption(
@@ -248,6 +291,7 @@ def _make_rejected_option(
         cargo_weight_tonnes=cargo_weight_tonnes,
         feasible=False,
         rejection_reason=reason,
+        safety_margin_days=safety_margin_days,
         risk_score=risk_score,
         vessel=vessel,
     )
@@ -365,28 +409,21 @@ def optimize_resupply(
             )
 
             if port is None:
-
                 rejected_options.append(
                     _make_rejected_option(
                         vessel_id="",
                         route_id=route_id,
                         origin_port_id=origin_port_id,
-                        destination_station_id=(
-                            destination_station_id
-                        ),
+                        destination_station_id=destination_station_id,
                         departure=departure,
                         distance_km=distance_km,
-                        cargo_weight_tonnes=(
-                            cargo_weight_tonnes
-                        ),
+                        cargo_weight_tonnes=cargo_weight_tonnes,
                         reason=(
-                            f"Port {origin_port_id} "
-                            f"not found."
+                            f"Port {origin_port_id} not found."
                         ),
                         risk_score=risk_score,
                     )
                 )
-
                 continue
 
             port_available = _get(
@@ -397,28 +434,21 @@ def optimize_resupply(
             )
 
             if not port_available:
-
                 rejected_options.append(
                     _make_rejected_option(
                         vessel_id="",
                         route_id=route_id,
                         origin_port_id=origin_port_id,
-                        destination_station_id=(
-                            destination_station_id
-                        ),
+                        destination_station_id=destination_station_id,
                         departure=departure,
                         distance_km=distance_km,
-                        cargo_weight_tonnes=(
-                            cargo_weight_tonnes
-                        ),
+                        cargo_weight_tonnes=cargo_weight_tonnes,
                         reason=(
-                            f"Port {origin_port_id} "
-                            f"unavailable."
+                            f"Port {origin_port_id} unavailable."
                         ),
                         risk_score=risk_score,
                     )
                 )
-
                 continue
 
             # ---------------------------------------------------------
@@ -440,30 +470,34 @@ def optimize_resupply(
             )
 
             if station is None:
-
                 rejected_options.append(
                     _make_rejected_option(
                         vessel_id="",
                         route_id=route_id,
                         origin_port_id=origin_port_id,
-                        destination_station_id=(
-                            destination_station_id
-                        ),
+                        destination_station_id=destination_station_id,
                         departure=departure,
                         distance_km=distance_km,
-                        cargo_weight_tonnes=(
-                            cargo_weight_tonnes
-                        ),
+                        cargo_weight_tonnes=cargo_weight_tonnes,
                         reason=(
                             f"Destination station "
-                            f"{destination_station_id} "
-                            f"not found."
+                            f"{destination_station_id} not found."
                         ),
                         risk_score=risk_score,
                     )
                 )
-
                 continue
+
+            # ---------------------------------------------------------
+            # Calculate inventory deadline ONCE per route/departure.
+            # ---------------------------------------------------------
+
+            latest_safe_arrival = _get_inventory_deadline(
+                station_inventory=station_inventory,
+                station_id=str(destination_station_id),
+                current_datetime=current_datetime,
+                safety_buffer_days=safety_buffer_days,
+            )
 
             # ---------------------------------------------------------
             # Evaluate vessels.
@@ -482,34 +516,26 @@ def optimize_resupply(
                 # Availability.
                 # -----------------------------------------------------
 
-                availability_reason = (
-                    _availability_reason(
-                        vessel,
-                        departure,
-                    )
+                availability_reason = _availability_reason(
+                    vessel,
+                    departure,
                 )
 
                 if availability_reason is not None:
-
                     rejected_options.append(
                         _make_rejected_option(
                             vessel_id=vessel_id,
                             route_id=route_id,
                             origin_port_id=origin_port_id,
-                            destination_station_id=(
-                                destination_station_id
-                            ),
+                            destination_station_id=destination_station_id,
                             departure=departure,
                             distance_km=distance_km,
-                            cargo_weight_tonnes=(
-                                cargo_weight_tonnes
-                            ),
+                            cargo_weight_tonnes=cargo_weight_tonnes,
                             reason=availability_reason,
                             vessel=vessel,
                             risk_score=risk_score,
                         )
                     )
-
                     continue
 
                 # -----------------------------------------------------
@@ -527,20 +553,15 @@ def optimize_resupply(
                 )
 
                 if cargo_weight_tonnes > cargo_capacity:
-
                     rejected_options.append(
                         _make_rejected_option(
                             vessel_id=vessel_id,
                             route_id=route_id,
                             origin_port_id=origin_port_id,
-                            destination_station_id=(
-                                destination_station_id
-                            ),
+                            destination_station_id=destination_station_id,
                             departure=departure,
                             distance_km=distance_km,
-                            cargo_weight_tonnes=(
-                                cargo_weight_tonnes
-                            ),
+                            cargo_weight_tonnes=cargo_weight_tonnes,
                             reason=(
                                 f"Cargo weight "
                                 f"{cargo_weight_tonnes} tonnes "
@@ -551,7 +572,6 @@ def optimize_resupply(
                             risk_score=risk_score,
                         )
                     )
-
                     continue
 
                 # -----------------------------------------------------
@@ -570,29 +590,22 @@ def optimize_resupply(
                 )
 
                 if speed_knots <= 0:
-
                     rejected_options.append(
                         _make_rejected_option(
                             vessel_id=vessel_id,
                             route_id=route_id,
                             origin_port_id=origin_port_id,
-                            destination_station_id=(
-                                destination_station_id
-                            ),
+                            destination_station_id=destination_station_id,
                             departure=departure,
                             distance_km=distance_km,
-                            cargo_weight_tonnes=(
-                                cargo_weight_tonnes
-                            ),
+                            cargo_weight_tonnes=cargo_weight_tonnes,
                             reason=(
-                                "Vessel speed must be "
-                                "greater than zero."
+                                "Vessel speed must be greater than zero."
                             ),
                             vessel=vessel,
                             risk_score=risk_score,
                         )
                     )
-
                     continue
 
                 # -----------------------------------------------------
@@ -608,10 +621,23 @@ def optimize_resupply(
 
                 arrival_datetime = (
                     departure
-                    + timedelta(
-                        days=duration_days
-                    )
+                    + timedelta(days=duration_days)
                 )
+
+                # -----------------------------------------------------
+                # Safety deadline check.
+                # -----------------------------------------------------
+
+                safety_margin_days = None
+
+                if latest_safe_arrival is not None:
+                    safety_margin_days = (
+                        (
+                            latest_safe_arrival
+                            - arrival_datetime
+                        ).total_seconds()
+                        / 86400.0
+                    )
 
                 # -----------------------------------------------------
                 # Fuel.
@@ -627,11 +653,9 @@ def optimize_resupply(
                     )
                 )
 
-                fuel_required = (
-                    calculate_fuel_consumption(
-                        duration_days,
-                        fuel_consumption_per_day,
-                    )
+                fuel_required = calculate_fuel_consumption(
+                    duration_days,
+                    fuel_consumption_per_day,
                 )
 
                 fuel_capacity = float(
@@ -647,38 +671,66 @@ def optimize_resupply(
                     fuel_required,
                     fuel_capacity,
                 ):
+                    rejected_options.append(
+                        _make_rejected_option(
+                            vessel_id=vessel_id,
+                            route_id=route_id,
+                            origin_port_id=origin_port_id,
+                            destination_station_id=destination_station_id,
+                            departure=departure,
+                            arrival_datetime=arrival_datetime,
+                            duration_days=duration_days,
+                            distance_km=distance_km,
+                            cargo_weight_tonnes=cargo_weight_tonnes,
+                            fuel_required_litres=fuel_required,
+                            reason=(
+                                f"Fuel requirement "
+                                f"{fuel_required:.2f} L exceeds "
+                                f"fuel capacity "
+                                f"{fuel_capacity:.2f} L."
+                            ),
+                            vessel=vessel,
+                            risk_score=risk_score,
+                            safety_margin_days=safety_margin_days,
+                        )
+                    )
+                    continue
+
+                # -----------------------------------------------------
+                # Inventory deadline is a HARD constraint.
+                # -----------------------------------------------------
+
+                if (
+                    latest_safe_arrival is not None
+                    and arrival_datetime > latest_safe_arrival
+                ):
+                    delay_days = (
+                        arrival_datetime
+                        - latest_safe_arrival
+                    ).total_seconds() / 86400.0
 
                     rejected_options.append(
                         _make_rejected_option(
                             vessel_id=vessel_id,
                             route_id=route_id,
                             origin_port_id=origin_port_id,
-                            destination_station_id=(
-                                destination_station_id
-                            ),
+                            destination_station_id=destination_station_id,
                             departure=departure,
-                            arrival_datetime=(
-                                arrival_datetime
-                            ),
+                            arrival_datetime=arrival_datetime,
                             duration_days=duration_days,
                             distance_km=distance_km,
-                            cargo_weight_tonnes=(
-                                cargo_weight_tonnes
-                            ),
-                            fuel_required_litres=(
-                                fuel_required
-                            ),
+                            cargo_weight_tonnes=cargo_weight_tonnes,
+                            fuel_required_litres=fuel_required,
                             reason=(
-                                f"Fuel requirement "
-                                f"{fuel_required:.2f} L "
-                                f"exceeds fuel capacity "
-                                f"{fuel_capacity:.2f} L."
+                                "Arrival misses the station inventory "
+                                f"safety deadline by {delay_days:.2f} "
+                                "days."
                             ),
                             vessel=vessel,
                             risk_score=risk_score,
+                            safety_margin_days=safety_margin_days,
                         )
                     )
-
                     continue
 
                 # -----------------------------------------------------
@@ -707,11 +759,9 @@ def optimize_resupply(
                     )
                 )
 
-                operating_cost = (
-                    calculate_operating_cost(
-                        duration_days,
-                        operating_cost_per_day,
-                    )
+                operating_cost = calculate_operating_cost(
+                    duration_days,
+                    operating_cost_per_day,
                 )
 
                 total_cost = calculate_total_cost(
@@ -720,44 +770,13 @@ def optimize_resupply(
                 )
 
                 # -----------------------------------------------------
-                # Inventory deadline.
-                # -----------------------------------------------------
-
-                latest_safe_arrival = (
-                    _get_inventory_deadline(
-                        station_inventory=station_inventory,
-                        station_id=str(
-                            destination_station_id
-                        ),
-                        current_datetime=current_datetime,
-                        safety_buffer_days=(
-                            safety_buffer_days
-                        ),
-                    )
-                )
-
-                safety_margin_days = None
-
-                if latest_safe_arrival is not None:
-
-                    safety_margin_days = (
-                        (
-                            latest_safe_arrival
-                            - arrival_datetime
-                        ).total_seconds()
-                        / 86400.0
-                    )
-
-                # -----------------------------------------------------
                 # Feasible option.
                 # -----------------------------------------------------
 
                 option = VoyageOption(
                     vessel_id=str(vessel_id),
                     route_id=str(route_id),
-                    origin_port_id=str(
-                        origin_port_id
-                    ),
+                    origin_port_id=str(origin_port_id),
                     destination_station_id=str(
                         destination_station_id
                     ),
@@ -769,14 +788,10 @@ def optimize_resupply(
                     fuel_cost=fuel_cost,
                     operating_cost=operating_cost,
                     total_cost=total_cost,
-                    cargo_weight_tonnes=(
-                        cargo_weight_tonnes
-                    ),
+                    cargo_weight_tonnes=cargo_weight_tonnes,
                     feasible=True,
                     rejection_reason=None,
-                    safety_margin_days=(
-                        safety_margin_days
-                    ),
+                    safety_margin_days=safety_margin_days,
                     risk_score=risk_score,
                     vessel=vessel,
                 )
@@ -785,21 +800,29 @@ def optimize_resupply(
 
     # -----------------------------------------------------------------
     # Rank feasible options.
+    #
+    # Hard constraints have already been applied above.
+    #
+    # Among safe options:
+    #   1. lowest total cost
+    #   2. lowest fuel consumption
+    #   3. lowest risk
+    #   4. shortest duration
+    #   5. larger safety margin as final tie-breaker
     # -----------------------------------------------------------------
 
     feasible_options.sort(
         key=lambda option: (
-            (
+            option.total_cost,
+            option.fuel_required_litres,
+            option.risk_score,
+            option.duration_days,
+            -(
                 option.safety_margin_days
                 if option.safety_margin_days is not None
                 else float("-inf")
             ),
-            -option.total_cost,
-            -option.fuel_required_litres,
-            -option.duration_days,
-            -option.risk_score,
-        ),
-        reverse=True,
+        )
     )
 
     best_option = (
@@ -810,7 +833,7 @@ def optimize_resupply(
 
     alternatives = (
         feasible_options[
-            1 : 1 + max_alternatives
+            1:1 + max_alternatives
         ]
         if best_option is not None
         else []

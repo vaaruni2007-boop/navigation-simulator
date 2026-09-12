@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -359,3 +359,209 @@ def test_simulation_state_reset():
     assert state.simulated_vessel.progress == pytest.approx(
         0.0
     )
+def test_paused_simulation_does_not_advance():
+    state = SimulationState(
+        clock=make_clock(),
+        station=make_station(),
+        vessel=make_vessel(),
+        route=make_route(),
+        station_inventory=make_inventory(),
+    )
+
+    state.start()
+
+    state.update(3600)
+
+    datetime_before_pause = state.simulation_datetime
+    progress_before_pause = state.vessel_progress
+    fuel_before_pause = state.fuel_consumed_litres
+    inventory_before_pause = dict(state.current_inventory)
+
+    state.pause()
+
+    state.update(86_400)
+
+    assert state.simulation_datetime == datetime_before_pause
+    assert state.vessel_progress == pytest.approx(
+        progress_before_pause
+    )
+    assert state.fuel_consumed_litres == pytest.approx(
+        fuel_before_pause
+    )
+    assert state.current_inventory == inventory_before_pause
+
+
+def test_vessel_does_not_overshoot_arrival():
+    simulated = SimulatedVessel(
+        vessel=make_vessel(),
+        route=make_route(),
+    )
+
+    departure = datetime(
+        2026,
+        11,
+        1,
+        tzinfo=timezone.utc,
+    )
+
+    simulated.start_voyage(departure)
+
+    duration_days = simulated.estimated_duration_days()
+
+    simulated.update(
+        duration_days * 86_400 * 10
+    )
+
+    assert simulated.is_complete is True
+    assert simulated.progress == pytest.approx(1.0)
+
+    expected_arrival = departure + timedelta(
+        days=simulated.planned_duration_days
+    )
+
+    assert simulated.current_datetime == expected_arrival
+
+
+def test_fuel_consumed_matches_vessel_fuel_remaining():
+    state = SimulationState(
+        clock=make_clock(),
+        station=make_station(),
+        vessel=make_vessel(),
+        route=make_route(),
+        station_inventory=make_inventory(),
+    )
+
+    state.start()
+    state.update(12 * 3600)
+
+    expected_consumed = (
+        state.vessel.fuel_capacity_litres
+        - state.simulated_vessel.fuel_remaining_litres
+    )
+
+    assert state.fuel_consumed_litres == pytest.approx(
+        expected_consumed
+    )
+
+
+def test_environment_event_changes_vessel_speed():
+    from simulation.environment_events import (
+        create_demo_timeline,
+    )
+
+    clock = make_clock()
+
+    timeline = create_demo_timeline(
+        clock.start_datetime
+    )
+
+    state = SimulationState(
+        clock=clock,
+        station=make_station(),
+        vessel=make_vessel(),
+        route=make_route(),
+        station_inventory=make_inventory(),
+        environment_timeline=timeline,
+    )
+
+    state.start()
+
+    normal_speed = state.simulated_vessel.effective_speed_knots
+
+    state.update(
+        2 * 86_400
+    )
+
+    assert state.active_environment_event == "Heavy Sea Ice"
+
+    ice_speed = state.simulated_vessel.effective_speed_knots
+
+    assert ice_speed < normal_speed
+
+
+def test_environment_event_increases_fuel_burn():
+    from simulation.environment_events import (
+        create_demo_timeline,
+    )
+
+    clock = make_clock()
+
+    timeline = create_demo_timeline(
+        clock.start_datetime
+    )
+
+    state = SimulationState(
+        clock=clock,
+        station=make_station(),
+        vessel=make_vessel(),
+        route=make_route(),
+        station_inventory=make_inventory(),
+        environment_timeline=timeline,
+    )
+
+    state.start()
+
+    normal_burn = (
+        state.simulated_vessel.current_fuel_burn_per_day
+    )
+
+    state.update(
+        2 * 86_400
+    )
+
+    harsh_burn = (
+        state.simulated_vessel.current_fuel_burn_per_day
+    )
+
+    assert harsh_burn > normal_burn
+
+
+def test_state_reports_fuel_remaining():
+    state = SimulationState(
+        clock=make_clock(),
+        station=make_station(),
+        vessel=make_vessel(),
+        route=make_route(),
+        station_inventory=make_inventory(),
+    )
+
+    state.start()
+    state.update(3600)
+
+    result = state.get_state()
+
+    assert "fuel_remaining_litres" in result
+    assert "fuel_remaining_percent" in result
+
+    assert result["fuel_remaining_litres"] == pytest.approx(
+        state.simulated_vessel.fuel_remaining_litres
+    )
+
+
+def test_simulation_completes_with_exact_arrival():
+    state = SimulationState(
+        clock=make_clock(),
+        station=make_station(),
+        vessel=make_vessel(),
+        route=make_route(),
+        station_inventory=make_inventory(),
+    )
+
+    state.start()
+
+    duration_days = (
+        state.simulated_vessel.estimated_duration_days()
+    )
+
+    state.update(
+        duration_days * 86_400 * 2
+    )
+
+    assert state.status == "completed"
+    assert state.simulated_vessel.status == "COMPLETED"
+    assert state.vessel_progress == pytest.approx(1.0)
+
+    assert (
+        state.simulation_datetime
+        == state.simulated_vessel.arrival_datetime
+    )    
